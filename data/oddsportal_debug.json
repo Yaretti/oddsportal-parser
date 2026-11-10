@@ -1,5 +1,5 @@
 {
-  "started_at": "2026-11-10T16:12:32+00:00",
+  "started_at": "2026-11-10T16:21:59+00:00",
   "url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
   "http_status": 200,
   "page_title": "Dropping Odds – Live Updates & Betting Tips | Odds Portal",
@@ -7,18 +7,20 @@
   "match_links_found": 40,
   "unique_match_links": 19,
   "cards_found": 19,
-  "parsed_rows": 18,
+  "parsed_rows": 19,
   "qualifying_rows": 0,
   "signals": 0,
   "new_database_records": 0,
   "missing_country": 0,
   "missing_league": 0,
+  "missing_match_time": 0,
+  "missing_teams": 0,
   "market_group_counts": {
     "negative_handicap": 2,
     "positive_handicap": 6,
     "total": 2,
     "1X2": 2,
-    "other": 6
+    "other": 7
   },
   "pagination_links": [
     {
@@ -26,16 +28,11 @@
       "href": "https://cookiepedia.co.uk/giving-consent-to-cookies"
     }
   ],
-  "parse_failures": 1,
-  "parse_failure_samples": [
-    {
-      "card": 17,
-      "reason": "duplicate_match_market",
-      "anchor_text": "Pamplona - Eibar"
-    }
-  ],
+  "parse_failures": 0,
+  "parse_failure_samples": [],
   "signal_samples": [],
-  "duration_seconds": 7.0,
-  "finished_at": "2026-11-10T16:12:39+00:00",
+  "body_preview": "Decimal Odds Decimal Odds (1.50) Fractional Odds (1/2) Money Line Odds (-200) Hong Kong Odds (0.50) Malay Odds (0.50) Indonesian Odds (-2.00) English English Polski LOGIN REGISTER ODDS COMPARISON COMMUNITY BOOKMAKERS Bet $5 Daily, Get Up To $350 In Bet Resets! CLAIM To claim, new users need to register, make a first-time deposit of $5 or more, and then simply place their first real-money wager on any FanDuel Sportsbook market (no odds limits) that is live on platform. All users will receive their $150 in Bonus Bets If Your Bet Wins within 72 hours of the bet settlement. HOME DROPPING ODDS SURE BETS BETTING TOOLS BETTING MY LEAGUES 0 Manage my leagues FOOTBALL Today's matches Popular LaLiga (21) Premier League (20) Bundesliga (19) Serie A (20) Champions League (18) Europa League (18) Ligue 1 (18) Euro U21 (4) All countries BASKETBALL TENNIS BASEBALL HOCKEY AMERICAN FOOTBALL AUSSIE RULES BADMINTON BANDY BOXING CRICKET DARTS ESPORTS FLOORBALL FUTSAL HANDBALL MMA RUGBY LEAGUE RUGBY UNION SNOOKER TABLE TENNIS VOLLEYBALL WATER POLO Bet $5, Get $100 in Bonus Bets Instantly! CLAIM 21+ and present in most states. (18+ DC/KY/NH/PR/WY). Void in NH/OR/ONT/PR. Eligibility restrictions apply. On behalf of Boot Hill Casino (KS). Pass-thru of per wager tax may apply in IL. 1 per new DraftKings customer. $5+ first-time bet req. Max. $100 issued as non-withdrawable Bonus Bets that expire in 7 days (168 hours). Stake removed from payout. Terms: sportsbook.draftkings.com/promos. Ends 5/31/26 at 11:59 PM ET. BET $20 GET $350 Fancash CLAIM New Customers Only. 21+. T&Cs Apply Get up to $1,500 paid back in bonus bets, if you don`t win ! CLAIM Gambling problem? Call 1-800-GAMBLER or 1-800-MY-RESET. 21+ only. Please Gamble Responsibly. See BetMGM.com for Terms. First Bet Offer for new customers only (if applicable). Subject to eligibility requirements. Bonus bets are non-withdrawable. In partnership with Kansas Crossing Casino and Hotel. Promotional offers not available in Mississippi, New York, Ontario, or Puerto Rico. Home > Dropping Odds Dropping Odds Dropping odds with OddsPortal enables you to find the online bookmakers that have not yet noticed that there have been big price changes in certain markets with other betting sites. Odds could be dropping due to a player injury or illness throughout a team, or because one team has potentially decided to play a weaker side ahead of a game. Some online betting sites may take notice, while others may not, allowing you to take advantage before there is any odds movement with certain bookmakers. Check out our page today for all of the best dropping odds tips across several different markets, while you can even filter it to a specific market or sport you are interested in. Filter Last 1 hour Last 12 hours Last 24 hours 10% dropping bookies 20% dropping bookies 30% dropping bookies 40% dropping bookies 50% dropping bookies All types 1X2 Over/Under 1X2 FT Only Home/Away Double Chance Asian Handicap Draw No Bet To Qualify Half Tim",
+  "duration_seconds": 8.3,
+  "finished_at": "2026-11-10T16:22:07+00:00",
   "result": "completed"
 }
