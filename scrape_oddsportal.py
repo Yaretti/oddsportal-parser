@@ -3,37 +3,34 @@
 # -*- coding: utf-8 -*-
 
 """
-OddsPortal Dropping Odds Parser
+GREENLINE / OddsPortal Dropping Odds Parser
 
 Критерії відбору:
-1. Коефіцієнт 4.00–5.00 -> 2.00 або нижче.
-2. Коефіцієнт 2.00–3.00 -> 1.80 або нижче.
+1. Початковий коефіцієнт 4.00–5.00 включно,
+   новий коефіцієнт <= 2.00.
+2. Початковий коефіцієнт 2.00–3.00 включно,
+   новий коефіцієнт <= 1.80.
 
 Пріоритет:
-NORMAL = одна група
-HIGH   = дві групи
-TOP    = усі три групи
+NORMAL = одна група ринків
+HIGH   = дві групи ринків
+TOP    = 1X2 + негативна фора + тотал
 
-Групи:
-- 1X2
-- negative_handicap
-- total
-
-Позитивна фора не враховується у HIGH/TOP.
-Рух коефіцієнта не є доказом фактичного грошового потоку.
+ВАЖЛИВО:
+Рух коефіцієнта не є доказом грошового потоку.
 """
 
+import csv
+import hashlib
+import json
+import logging
 import os
 import re
-import csv
-import json
-import time
-import hashlib
 import sqlite3
-import logging
+import time
 
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import sync_playwright
@@ -44,8 +41,8 @@ from playwright.sync_api import sync_playwright
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 DATA_DIR = BASE_DIR / "data"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SOURCE_URL = os.getenv(
@@ -53,8 +50,12 @@ SOURCE_URL = os.getenv(
     "https://www.oddsportal.com/dropping-odds/2/2/0/overall/"
 )
 
-HEADLESS = True
-TIMEOUT_MS = 60000
+HEADLESS = os.getenv("ODDSPORTAL_HEADLESS", "true").lower() != "false"
+
+TIMEOUT_MS = int(
+    os.getenv("ODDSPORTAL_TIMEOUT_MS", "60000")
+)
+
 DROP_TOLERANCE_PP = 2.0
 
 LATEST_CSV = DATA_DIR / "oddsportal_latest.csv"
@@ -67,6 +68,18 @@ DEBUG_JSON = DATA_DIR / "oddsportal_debug.json"
 DEBUG_HTML = DATA_DIR / "oddsportal_cards_debug.html"
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+log = logging.getLogger("oddsportal")
+
+
+# ============================================================
+# CSV FIELDS
+# ============================================================
+
 CSV_FIELDS = [
     "scraped_at",
     "sport",
@@ -74,18 +87,16 @@ CSV_FIELDS = [
     "country_slug",
     "league",
     "teams",
-    "home_team",
-    "away_team",
     "match_time",
     "market",
     "market_code",
     "market_group",
     "selection",
     "selection_code",
-    "handicap_line",
     "flow_to_team",
     "flow_direction",
     "flow_confidence",
+    "handicap_line",
     "drop_pct",
     "calculated_drop_pct",
     "odds_old",
@@ -93,9 +104,8 @@ CSV_FIELDS = [
     "best_current_odds",
     "qualifies",
     "match_url",
-    "match_key"
+    "match_key",
 ]
-
 
 SIGNAL_FIELDS = [
     "scraped_at",
@@ -107,22 +117,13 @@ SIGNAL_FIELDS = [
     "market_groups",
     "priority",
     "markets",
-    "flow_targets",
     "match_url",
-    "match_key"
+    "match_key",
 ]
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-log = logging.getLogger("oddsportal")
-
-
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 
 def utc_now():
@@ -133,18 +134,16 @@ def clean_text(value):
     if value is None:
         return ""
 
-    value = str(value).replace("\xa0", " ")
-
-    return re.sub(r"\s+", " ", value).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value).replace("\xa0", " ")
+    ).strip()
 
 
 def safe_float(value):
     try:
-        if value is None:
-            return None
-
-        return float(str(value).replace(",", ".").strip())
-
+        return float(str(value).replace(",", "."))
     except (TypeError, ValueError):
         return None
 
@@ -162,6 +161,7 @@ def normalize_team_name(value):
 
 
 def normalize_match_url(url):
+
     if not url:
         return ""
 
@@ -177,17 +177,18 @@ def normalize_match_url(url):
 
 
 def make_match_key(teams, match_url):
-    base = normalize_match_url(match_url)
 
-    if base:
-        return base.lower()
+    normalized_url = normalize_match_url(match_url)
+
+    if normalized_url:
+        return normalized_url.lower()
 
     return normalize_team_name(teams)
 
 
 def make_record_key(row):
 
-    fields = (
+    keys = [
         "match_key",
         "market_group",
         "market_code",
@@ -195,18 +196,22 @@ def make_record_key(row):
         "handicap_line",
         "odds_old",
         "odds_new",
-        "drop_pct"
-    )
+        "drop_pct",
+    ]
 
     raw = "|".join(
         str(row.get(key, ""))
-        for key in fields
+        for key in keys
     )
 
     return hashlib.sha256(
         raw.encode("utf-8")
     ).hexdigest()
 
+
+# ============================================================
+# ODDS PARSING
+# ============================================================
 
 def parse_decimal_tokens(text):
 
@@ -227,15 +232,97 @@ def parse_decimal_tokens(text):
 def parse_drop_percentage(text):
 
     matches = re.findall(
-        r"(-\s*\d{1,3}(?:[.,]\d+)?)\s*%",
+        r"[-−]\s*(\d{1,3}(?:[.,]\d+)?)\s*%",
         text or ""
     )
 
     if not matches:
         return None
 
-    return safe_float(
-        matches[0].replace(" ", "")
+    value = safe_float(matches[0])
+
+    if value is None:
+        return None
+
+    return -abs(value)
+
+
+def calculate_drop(old_odds, new_odds):
+
+    if old_odds is None or new_odds is None:
+        return None
+
+    if old_odds <= 0:
+        return None
+
+    return (
+        (new_odds - old_odds)
+        / old_odds
+    ) * 100
+
+
+def validate_drop(old_odds, new_odds, displayed_drop):
+
+    calculated = calculate_drop(
+        old_odds,
+        new_odds
+    )
+
+    if calculated is None:
+        return False, None
+
+    if displayed_drop is None:
+        return False, calculated
+
+    valid = (
+        abs(calculated - displayed_drop)
+        <= DROP_TOLERANCE_PP
+    )
+
+    return valid, calculated
+
+
+def extract_odds_from_card(text, displayed_drop):
+
+    numbers = parse_decimal_tokens(text)
+
+    if len(numbers) < 3:
+        return None, None, None, None
+
+    candidates = []
+
+    for index in range(len(numbers) - 2):
+
+        old_odds = numbers[index]
+        new_odds = numbers[index + 1]
+        best_odds = numbers[index + 2]
+
+        valid, calculated = validate_drop(
+            old_odds,
+            new_odds,
+            displayed_drop
+        )
+
+        if valid:
+
+            candidates.append((
+                index,
+                old_odds,
+                new_odds,
+                best_odds,
+                calculated
+            ))
+
+    if not candidates:
+        return None, None, None, None
+
+    _, old_odds, new_odds, best_odds, calculated = candidates[0]
+
+    return (
+        old_odds,
+        new_odds,
+        best_odds,
+        calculated
     )
 
 
@@ -249,37 +336,14 @@ def qualifies_odds(old_odds, new_odds):
         return False
 
     # Rule 1
-    if 4.00 <= old_odds <= 5.00 and new_odds <= 2.00:
-        return True
+    if 4.00 <= old_odds <= 5.00:
+        return new_odds <= 2.00
 
     # Rule 2
-    if 2.00 <= old_odds <= 3.00 and new_odds <= 1.80:
-        return True
+    if 2.00 <= old_odds <= 3.00:
+        return new_odds <= 1.80
 
     return False
-
-
-def validate_drop(old_odds, new_odds, displayed_drop):
-
-    if old_odds is None or new_odds is None:
-        return False, None
-
-    if old_odds <= 0:
-        return False, None
-
-    calculated = (
-        (new_odds - old_odds) / old_odds
-    ) * 100
-
-    if displayed_drop is None:
-        return True, calculated
-
-    valid = (
-        abs(calculated - displayed_drop)
-        <= DROP_TOLERANCE_PP
-    )
-
-    return valid, calculated
 
 
 # ============================================================
@@ -294,7 +358,7 @@ def parse_market_from_url(url):
         "market_group": "other",
         "selection_code": "",
         "selection": "",
-        "handicap_line": ""
+        "handicap_line": "",
     }
 
     if not url or "#" not in url:
@@ -306,6 +370,9 @@ def parse_market_from_url(url):
         return result
 
     tokens = fragment.split(":", 1)[1].split(";")
+
+    if not tokens:
+        return result
 
     code = tokens[0].strip().lower()
 
@@ -321,17 +388,17 @@ def parse_market_from_url(url):
 
     if code == "1x2":
 
-        result.update({
-            "market": "1X2",
-            "market_group": "1X2"
-        })
+        result.update(
+            market="1X2",
+            market_group="1X2"
+        )
 
     elif code in ("over-under", "ou", "total"):
 
-        result.update({
-            "market": "Total",
-            "market_group": "total"
-        })
+        result.update(
+            market="Total",
+            market_group="total"
+        )
 
         if len(tokens) > 2:
             result["handicap_line"] = tokens[2]
@@ -392,7 +459,7 @@ def detect_market_label(text, fallback):
         r"1X2",
         r"AH\s*[+-]?\d+(?:[.,]\d+)?",
         r"EH\s*[+-]?\d+(?:[.,]\d+)?",
-        r"DNB"
+        r"DNB",
     ]
 
     for pattern in patterns:
@@ -408,10 +475,6 @@ def detect_market_label(text, fallback):
 
     return fallback
 
-
-# ============================================================
-# SELECTION / FLOW DIRECTION
-# ============================================================
 
 def detect_visible_selection(text, market_data):
 
@@ -429,7 +492,6 @@ def detect_visible_selection(text, market_data):
     lines = [x for x in lines if x]
 
     group = market_data.get("market_group")
-    code = market_data.get("market_code")
 
     if group == "total":
 
@@ -462,199 +524,74 @@ def detect_visible_selection(text, market_data):
 
         for line in reversed(lines):
 
-            if line in (
-                "1", "X", "2",
-                "Home", "Draw", "Away"
-            ):
+            if line in ("1", "2", "Home", "Away"):
                 return line
 
-    selection_code = market_data.get(
-        "selection_code",
-        ""
-    )
+    code = market_data.get("selection_code", "")
 
-    if selection_code:
-        return f"code:{selection_code}"
-
-    return ""
-
-
-def resolve_flow(market_data, selection):
-
-    code = market_data.get("market_code", "")
-
-    normalized = clean_text(selection).lower()
-
-    unknown = {
-        "flow_to_team": "Невизначено",
-        "flow_direction": "unknown",
-        "flow_confidence": "low"
-    }
-
-    if normalized.startswith("code:") or not normalized:
-        return unknown
-
-    # TOTAL
-
-    if code in ("over-under", "ou", "total"):
-
-        if normalized == "over":
-
-            return {
-                "flow_to_team": "Тотал: Over",
-                "flow_direction": "total_over",
-                "flow_confidence": "high"
-            }
-
-        if normalized == "under":
-
-            return {
-                "flow_to_team": "Тотал: Under",
-                "flow_direction": "total_under",
-                "flow_confidence": "high"
-            }
-
-    # 1X2
-
-    if code == "1x2":
-
-        mapping = {
-            "1": ("Господарі", "home"),
-            "home": ("Господарі", "home"),
-
-            "2": ("Гості", "away"),
-            "away": ("Гості", "away"),
-
-            "x": ("Нічия", "draw"),
-            "draw": ("Нічия", "draw"),
-
-            "1x": ("1X", "home_or_draw"),
-            "x2": ("X2", "draw_or_away"),
-            "12": ("12", "no_draw")
-        }
-
-        if normalized in mapping:
-
-            target, direction = mapping[normalized]
-
-            return {
-                "flow_to_team": target,
-                "flow_direction": direction,
-                "flow_confidence": "high"
-            }
-
-    # ASIAN / EUROPEAN HANDICAP
-
-    if code in ("ah", "eh"):
-
-        european = code == "eh"
-
-        mapping = {
-            "1": (
-                "Господарі з урахуванням фори"
-                if european
-                else "Господарі (AH)",
-                "home_handicap"
-            ),
-
-            "home": (
-                "Господарі з урахуванням фори"
-                if european
-                else "Господарі (AH)",
-                "home_handicap"
-            ),
-
-            "2": (
-                "Гості з урахуванням фори"
-                if european
-                else "Гості (AH)",
-                "away_handicap"
-            ),
-
-            "away": (
-                "Гості з урахуванням фори"
-                if european
-                else "Гості (AH)",
-                "away_handicap"
-            )
-        }
-
-        # EH X is NOT ordinary match draw.
-        if normalized == "x" and european:
-
-            return {
-                "flow_to_team": "Фора: нічия (EH X)",
-                "flow_direction": "european_handicap_draw",
-                "flow_confidence": "high"
-            }
-
-        if normalized in mapping:
-
-            target, direction = mapping[normalized]
-
-            return {
-                "flow_to_team": target,
-                "flow_direction": direction,
-                "flow_confidence": "high"
-            }
-
-    # DRAW NO BET
-
-    if code == "dnb":
-
-        if normalized in ("1", "home"):
-
-            target = "Господарі (DNB)"
-            direction = "home_dnb"
-
-        elif normalized in ("2", "away"):
-
-            target = "Гості (DNB)"
-            direction = "away_dnb"
-
-        else:
-
-            return unknown
-
-        return {
-            "flow_to_team": target,
-            "flow_direction": direction,
-            "flow_confidence": "high"
-        }
-
-    # TO QUALIFY
-
-    if code == "qualify":
-
-        if normalized in ("1", "home"):
-
-            target = "Господарі: проходять далі"
-            direction = "home_qualify"
-
-        elif normalized in ("2", "away"):
-
-            target = "Гості: проходять далі"
-            direction = "away_qualify"
-
-        else:
-
-            return unknown
-
-        return {
-            "flow_to_team": target,
-            "flow_direction": direction,
-            "flow_confidence": "high"
-        }
-
-    return {
-        "flow_to_team": f"Вибір: {selection}",
-        "flow_direction": "unmapped_selection",
-        "flow_confidence": "medium"
-    }
+    return f"code:{code}" if code else ""
 
 
 # ============================================================
-# COUNTRY / LEAGUE
+# FLOW DIRECTION
+# ============================================================
+
+def detect_flow_direction(selection, market_group, teams):
+
+    selection = clean_text(selection).lower()
+
+    sides = (
+        teams.split(" - ", 1)
+        if " - " in teams
+        else []
+    )
+
+    home = sides[0] if len(sides) == 2 else ""
+    away = sides[1] if len(sides) == 2 else ""
+
+    result = {
+        "flow_to_team": "Невизначено",
+        "flow_direction": "Невизначено",
+        "flow_confidence": "low",
+    }
+
+    if selection in ("home", "home team") and home:
+
+        result.update({
+            "flow_to_team": home,
+            "flow_direction": "На господарів",
+            "flow_confidence": "high",
+        })
+
+    elif selection in ("away", "away team") and away:
+
+        result.update({
+            "flow_to_team": away,
+            "flow_direction": "На гостей",
+            "flow_confidence": "high",
+        })
+
+    elif market_group == "total" and selection == "over":
+
+        result.update({
+            "flow_to_team": "Не застосовується",
+            "flow_direction": "Тотал більше",
+            "flow_confidence": "high",
+        })
+
+    elif market_group == "total" and selection == "under":
+
+        result.update({
+            "flow_to_team": "Не застосовується",
+            "flow_direction": "Тотал менше",
+            "flow_confidence": "high",
+        })
+
+    return result
+
+
+# ============================================================
+# COUNTRY AND LEAGUE
 # ============================================================
 
 COUNTRY_NAMES = {
@@ -694,7 +631,7 @@ COUNTRY_NAMES = {
     "australia": "Australia",
     "india": "India",
     "international": "International",
-    "world": "International"
+    "world": "International",
 }
 
 
@@ -724,9 +661,12 @@ def extract_country_league(links):
         if not href:
             continue
 
-        path = urlsplit(href).path.lower().strip("/")
-
-        parts = path.split("/")
+        parts = (
+            urlsplit(href)
+            .path.lower()
+            .strip("/")
+            .split("/")
+        )
 
         if len(parts) != 3:
             continue
@@ -735,15 +675,14 @@ def extract_country_league(links):
             continue
 
         country_slug = parts[1]
-        league_slug = parts[2]
 
         if country_slug in ("h2h", "football"):
             continue
 
         candidates.append({
             "country_slug": country_slug,
-            "league": label or slug_to_title(league_slug),
-            "path": path
+            "league": label or slug_to_title(parts[2]),
+            "path": "/".join(parts),
         })
 
     if not candidates:
@@ -762,65 +701,60 @@ def extract_country_league(links):
 
 
 # ============================================================
-# DATE / MATCH PARSING
+# MATCH TIME AND TEAMS
 # ============================================================
 
-def parse_match_time_and_teams(anchor_text):
+TIME_PATTERNS = [
+    r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{1,2}:\d{2}\b",
+    r"\b(?:Today|Tomorrow|Yesterday)\s+\d{1,2}:\d{2}\b",
+    r"\b\d{1,2}:\d{2}\b",
+]
+
+
+def parse_match_time_and_teams(anchor_text, card_text=""):
+
+    anchor_text = str(anchor_text or "")
+    card_text = str(card_text or "")
+
+    match_time = ""
+
+    for source in (card_text, anchor_text):
+
+        for pattern in TIME_PATTERNS:
+
+            found = re.search(
+                pattern,
+                source,
+                re.IGNORECASE
+            )
+
+            if found:
+                match_time = clean_text(found.group(0))
+                break
+
+        if match_time:
+            break
 
     lines = [
         clean_text(x)
-        for x in str(anchor_text).splitlines()
+        for x in anchor_text.splitlines()
     ]
 
     lines = [x for x in lines if x]
 
-    full_text = clean_text(anchor_text)
-
-    date_time_pattern = re.compile(
-        r"^\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{1,2}:\d{2})\s+(.+?)\s*$",
-        re.IGNORECASE
-    )
-
-    relative_pattern = re.compile(
-        r"^\s*((?:(?:Today|Tomorrow|Yesterday)\s+)?\d{1,2}:\d{2})\s+(.+?)\s*$",
-        re.IGNORECASE
-    )
-
-    match_time = ""
     cleaned = []
 
     for line in lines:
 
-        date_match = date_time_pattern.match(line)
-
-        relative_match = relative_pattern.match(line)
-
-        if date_match:
-
-            match_time = clean_text(
-                date_match.group(1)
-            )
-
-            cleaned.append(
-                clean_text(date_match.group(2))
-            )
-
-            continue
-
-        if relative_match:
-
-            match_time = clean_text(
-                relative_match.group(1)
-            )
-
-            cleaned.append(
-                clean_text(relative_match.group(2))
-            )
-
-            continue
-
         line = re.sub(
             r"\b(?:Today|Tomorrow|Yesterday)\b",
+            "",
+            line,
+            flags=re.IGNORECASE
+        )
+
+        line = re.sub(
+            r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{1,2}:\d{2}\b",
             "",
             line,
             flags=re.IGNORECASE
@@ -832,21 +766,10 @@ def parse_match_time_and_teams(anchor_text):
             line
         )
 
-        line = re.sub(
-            r"\b\d{1,2}\s+[A-Za-z]{3}\b",
-            "",
-            line,
-            flags=re.IGNORECASE
-        )
-
         line = clean_text(line)
 
         if line and not re.fullmatch(r"[-–—]+", line):
-
-            if line.lower() not in ("football", "h2h"):
-                cleaned.append(line)
-
-    # Explicit team separator
+            cleaned.append(line)
 
     for line in cleaned:
 
@@ -863,42 +786,26 @@ def parse_match_time_and_teams(anchor_text):
             away = clean_text(parts[1])
 
             if home and away:
-
                 return (
                     f"{home} - {away}",
-                    match_time,
-                    home,
-                    away
+                    match_time
                 )
-
-    # Separate lines for teams
 
     if len(cleaned) >= 2:
 
-        home = cleaned[-2]
-        away = cleaned[-1]
-
         return (
-            f"{home} - {away}",
-            match_time,
-            home,
-            away
+            f"{cleaned[-2]} - {cleaned[-1]}",
+            match_time
         )
 
     if len(cleaned) == 1:
+        return cleaned[0], match_time
 
-        return (
-            cleaned[0],
-            match_time,
-            cleaned[0],
-            ""
-        )
-
-    return full_text, match_time, "", ""
+    return "", match_time
 
 
 # ============================================================
-# PLAYWRIGHT EXTRACTION
+# DOM EXTRACTION
 # ============================================================
 
 EXTRACT_CARDS_JS = r"""
@@ -913,33 +820,26 @@ EXTRACT_CARDS_JS = r"""
 
   for (const anchor of anchors) {
 
-    const href =
-      anchor.href ||
-      anchor.getAttribute("href") ||
-      "";
+    const href = anchor.href || anchor.getAttribute("href") || "";
 
-    if (!href || seen.has(href)) {
-      continue;
-    }
+    if (!href || seen.has(href)) continue;
 
     seen.add(href);
 
     let node = anchor;
     let selected = null;
 
-    for (let depth = 0; depth < 13 && node; depth++) {
+    for (let depth = 0; depth < 14 && node; depth++) {
 
       const text = node.innerText || "";
 
       const hasBest = /Best Current Odds/i.test(text);
 
-      const hasDrop =
-        /-\s*\d+(?:[.,]\d+)?\s*%/.test(text);
+      const hasDrop = /[-−]\s*\d+(?:[.,]\d+)?\s*%/.test(text);
 
-      const odds =
-        text.match(
-          /(?<![\d])\d{1,4}[.,]\d{1,3}(?![\d])/g
-        ) || [];
+      const odds = text.match(
+        /(?<![\d])\d{1,4}[.,]\d{1,3}(?![\d])/g
+      ) || [];
 
       const links = Array.from(
         node.querySelectorAll("a")
@@ -966,8 +866,13 @@ EXTRACT_CARDS_JS = r"""
       node = node.parentElement;
     }
 
-    output.push(
-      selected || {
+    if (selected) {
+
+      output.push(selected);
+
+    } else {
+
+      output.push({
         href,
         anchorText: anchor.innerText || "",
         text: "",
@@ -975,18 +880,21 @@ EXTRACT_CARDS_JS = r"""
         links: [],
         depth: -1,
         oddsCount: 0
-      }
-    );
+      });
+
+    }
   }
 
-  const paginationLinks = Array.from(
+  const all = anchors.map(
+    a => a.href || a.getAttribute("href") || ""
+  );
+
+  const pagination = Array.from(
     document.querySelectorAll("a[href]")
   )
   .filter(a =>
-    /next|more|load more/i.test(
-      (a.innerText || "").trim()
-    ) ||
-    /page=\d+/i.test(a.href || "")
+    /next|more|load more/i.test((a.innerText || "").trim())
+    || /page=\d+/i.test(a.href || "")
   )
   .map(a => ({
     text: (a.innerText || "").trim(),
@@ -995,142 +903,17 @@ EXTRACT_CARDS_JS = r"""
 
   return {
     cards: output,
-    match_links_found: anchors.length,
-    unique_match_links: seen.size,
-    pagination_links: paginationLinks
+    match_links_found: all.length,
+    unique_match_links: [...new Set(all)].length,
+    pagination_links: pagination
   };
 }
 """
 
 
-def scrape_page():
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ]
-        )
-
-        context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 1000
-            },
-            locale="en-US",
-            timezone_id="UTC",
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
-        )
-
-        page = context.new_page()
-
-        page.set_default_timeout(TIMEOUT_MS)
-
-        response = page.goto(
-            SOURCE_URL,
-            wait_until="domcontentloaded",
-            timeout=TIMEOUT_MS
-        )
-
-        http_status = (
-            response.status
-            if response
-            else None
-        )
-
-        page.wait_for_timeout(5000)
-
-        try:
-
-            page.wait_for_selector(
-                'a[href*="/football/h2h/"]',
-                timeout=20000
-            )
-
-        except Exception:
-
-            log.warning(
-                "Match links did not appear before timeout."
-            )
-
-        extracted = page.evaluate(
-            EXTRACT_CARDS_JS
-        )
-
-        result = {
-            "http_status": http_status,
-            "page_title": page.title(),
-            "final_url": page.url,
-            "cards": extracted.get("cards", []),
-            "match_links_found": extracted.get(
-                "match_links_found", 0
-            ),
-            "unique_match_links": extracted.get(
-                "unique_match_links", 0
-            ),
-            "pagination_links": extracted.get(
-                "pagination_links", []
-            )
-        }
-
-        context.close()
-        browser.close()
-
-        return result
-
-
 # ============================================================
-# ODDS EXTRACTION
+# CARD PARSER
 # ============================================================
-
-def extract_odds_from_card(text, displayed_drop):
-
-    numbers = parse_decimal_tokens(text)
-
-    if len(numbers) < 3:
-        return None, None, None, None
-
-    candidates = []
-
-    for i in range(len(numbers) - 2):
-
-        old_odds, new_odds, best_odds = numbers[i:i + 3]
-
-        valid, calculated = validate_drop(
-            old_odds,
-            new_odds,
-            displayed_drop
-        )
-
-        if valid:
-
-            candidates.append((
-                i,
-                old_odds,
-                new_odds,
-                best_odds,
-                calculated
-            ))
-
-    if not candidates:
-        return None, None, None, None
-
-    chosen = candidates[0]
-
-    return (
-        chosen[1],
-        chosen[2],
-        chosen[3],
-        chosen[4]
-    )
-
 
 def parse_card(card, scraped_at):
 
@@ -1146,24 +929,18 @@ def parse_card(card, scraped_at):
     if displayed_drop is None:
         return None, "drop_percentage_not_found"
 
-    old_odds, new_odds, best_odds, calculated_drop = (
-        extract_odds_from_card(
-            text,
-            displayed_drop
-        )
+    (
+        old_odds,
+        new_odds,
+        best_odds,
+        calculated_drop
+    ) = extract_odds_from_card(
+        text,
+        displayed_drop
     )
 
     if old_odds is None:
         return None, "odds_triplet_not_validated"
-
-    valid, _ = validate_drop(
-        old_odds,
-        new_odds,
-        displayed_drop
-    )
-
-    if not valid:
-        return None, "drop_percentage_mismatch"
 
     market_data = parse_market_from_url(href)
 
@@ -1177,17 +954,19 @@ def parse_card(card, scraped_at):
         market_data
     )
 
-    flow = resolve_flow(
-        market_data,
-        market_data["selection"]
-    )
-
     country, country_slug, league = extract_country_league(
         card.get("links", [])
     )
 
-    teams, match_time, home_team, away_team = (
-        parse_match_time_and_teams(anchor_text)
+    teams, match_time = parse_match_time_and_teams(
+        anchor_text,
+        text
+    )
+
+    flow = detect_flow_direction(
+        market_data["selection"],
+        market_data["market_group"],
+        teams
     )
 
     match_key = make_match_key(
@@ -1196,18 +975,12 @@ def parse_card(card, scraped_at):
     )
 
     row = {
-
         "scraped_at": scraped_at,
-
         "sport": "Football",
-
         "country": country,
         "country_slug": country_slug,
         "league": league,
-
         "teams": teams,
-        "home_team": home_team,
-        "away_team": away_team,
         "match_time": match_time,
 
         "market": market_data["market"],
@@ -1216,16 +989,19 @@ def parse_card(card, scraped_at):
 
         "selection": market_data["selection"],
         "selection_code": market_data["selection_code"],
-        "handicap_line": market_data["handicap_line"],
 
         "flow_to_team": flow["flow_to_team"],
         "flow_direction": flow["flow_direction"],
         "flow_confidence": flow["flow_confidence"],
 
+        "handicap_line": market_data["handicap_line"],
+
         "drop_pct": displayed_drop,
-        "calculated_drop_pct": round(
-            calculated_drop,
-            2
+
+        "calculated_drop_pct": (
+            round(calculated_drop, 2)
+            if calculated_drop is not None
+            else ""
         ),
 
         "odds_old": old_odds,
@@ -1238,14 +1014,14 @@ def parse_card(card, scraped_at):
         ),
 
         "match_url": href,
-        "match_key": match_key
+        "match_key": match_key,
     }
 
     return row, None
 
 
 # ============================================================
-# CSV
+# CSV WRITING
 # ============================================================
 
 def write_csv(path, rows, fields):
@@ -1255,10 +1031,10 @@ def write_csv(path, rows, fields):
         "w",
         newline="",
         encoding="utf-8-sig"
-    ) as f:
+    ) as file:
 
         writer = csv.DictWriter(
-            f,
+            file,
             fieldnames=fields,
             extrasaction="ignore"
         )
@@ -1282,10 +1058,10 @@ def append_csv(path, rows, fields):
         "a",
         newline="",
         encoding="utf-8-sig"
-    ) as f:
+    ) as file:
 
         writer = csv.DictWriter(
-            f,
+            file,
             fieldnames=fields,
             extrasaction="ignore"
         )
@@ -1297,63 +1073,68 @@ def append_csv(path, rows, fields):
 
 
 # ============================================================
-# SQLITE MIGRATION
+# SQLITE
 # ============================================================
 
 DB_COLUMNS = {
-
     "record_key": "TEXT",
-
     "scraped_at": "TEXT",
-
     "sport": "TEXT",
-
     "country": "TEXT",
     "country_slug": "TEXT",
     "league": "TEXT",
-
     "teams": "TEXT",
-    "home_team": "TEXT",
-    "away_team": "TEXT",
     "match_time": "TEXT",
-
     "market": "TEXT",
     "market_code": "TEXT",
     "market_group": "TEXT",
-
     "selection": "TEXT",
     "selection_code": "TEXT",
-    "handicap_line": "TEXT",
-
     "flow_to_team": "TEXT",
     "flow_direction": "TEXT",
     "flow_confidence": "TEXT",
-
+    "handicap_line": "TEXT",
     "drop_pct": "REAL",
     "calculated_drop_pct": "REAL",
-
     "odds_old": "REAL",
     "odds_new": "REAL",
     "best_current_odds": "REAL",
-
     "qualifies": "INTEGER",
-
     "match_url": "TEXT",
-    "match_key": "TEXT"
+    "match_key": "TEXT",
 }
 
 
 def initialize_database(conn):
 
-    definitions = ",\n".join(
-        f'"{name}" {kind}'
-        for name, kind in DB_COLUMNS.items()
-    )
-
-    conn.execute(f"""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS odds_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            {definitions}
+            record_key TEXT,
+            scraped_at TEXT,
+            sport TEXT,
+            country TEXT,
+            country_slug TEXT,
+            league TEXT,
+            teams TEXT,
+            match_time TEXT,
+            market TEXT,
+            market_code TEXT,
+            market_group TEXT,
+            selection TEXT,
+            selection_code TEXT,
+            flow_to_team TEXT,
+            flow_direction TEXT,
+            flow_confidence TEXT,
+            handicap_line TEXT,
+            drop_pct REAL,
+            calculated_drop_pct REAL,
+            odds_old REAL,
+            odds_new REAL,
+            best_current_odds REAL,
+            qualifies INTEGER,
+            match_url TEXT,
+            match_key TEXT
         )
     """)
 
@@ -1364,59 +1145,16 @@ def initialize_database(conn):
         ).fetchall()
     }
 
-    # Non-destructive migration of old database.
-    for name, kind in DB_COLUMNS.items():
+    # Міграція без видалення старих записів.
+    for column, column_type in DB_COLUMNS.items():
 
-        if name not in existing:
+        if column not in existing:
 
             conn.execute(
-                f'ALTER TABLE odds_history ADD COLUMN "{name}" {kind}'
+                f'ALTER TABLE odds_history ADD COLUMN "{column}" {column_type}'
             )
 
     conn.commit()
-
-    info = conn.execute(
-        "PRAGMA table_info(odds_history)"
-    ).fetchall()
-
-    column_names = [
-        item[1]
-        for item in info
-    ]
-
-    old_rows = conn.execute("""
-        SELECT *
-        FROM odds_history
-        WHERE record_key IS NULL
-           OR record_key = ''
-    """).fetchall()
-
-    for old in old_rows:
-
-        data = dict(
-            zip(column_names, old)
-        )
-
-        match_key = data.get("match_key") or make_match_key(
-            data.get("teams", ""),
-            data.get("match_url", "")
-        )
-
-        temp = dict(data)
-        temp["match_key"] = match_key
-
-        record_key = make_record_key(temp)
-
-        conn.execute("""
-            UPDATE odds_history
-            SET record_key = ?,
-                match_key = ?
-            WHERE id = ?
-        """, (
-            record_key,
-            match_key,
-            data.get("id")
-        ))
 
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_odds_history_record_key
@@ -1429,6 +1167,8 @@ def initialize_database(conn):
 def save_history(rows):
 
     conn = sqlite3.connect(DATABASE_FILE)
+
+    new_rows = []
 
     try:
 
@@ -1443,8 +1183,6 @@ def save_history(rows):
             for item in table_info
         }
 
-        new_rows = []
-
         for row in rows:
 
             if not row.get("qualifies"):
@@ -1456,7 +1194,7 @@ def save_history(rows):
                 """
                 SELECT 1
                 FROM odds_history
-                WHERE record_key = ?
+                WHERE record_key=?
                 LIMIT 1
                 """,
                 (record_key,)
@@ -1476,7 +1214,8 @@ def save_history(rows):
                 if key in columns
             ]
 
-            # Support older schemas with required columns.
+            # Сумісність із додатковими NOT NULL колонками
+            # старої таблиці, якщо вони існують.
             for item in table_info:
 
                 name = item[1]
@@ -1494,25 +1233,25 @@ def save_history(rows):
                     insert_columns.append(name)
                     values[name] = ""
 
-            names_sql = ", ".join(
-                f'"{name}"'
-                for name in insert_columns
+            column_sql = ", ".join(
+                f'"{column}"'
+                for column in insert_columns
             )
 
-            marks = ", ".join(
+            placeholders = ", ".join(
                 "?"
                 for _ in insert_columns
             )
 
             params = [
-                values.get(name, "")
-                for name in insert_columns
+                values.get(column, "")
+                for column in insert_columns
             ]
 
             conn.execute(
                 f"""
-                INSERT INTO odds_history ({names_sql})
-                VALUES ({marks})
+                INSERT INTO odds_history ({column_sql})
+                VALUES ({placeholders})
                 """,
                 params
             )
@@ -1546,13 +1285,12 @@ def build_signals(rows, scraped_at):
         if not key:
             continue
 
-        grouped.setdefault(
-            key,
-            {
+        if key not in grouped:
+
+            grouped[key] = {
                 "rows": [],
                 "groups": set()
             }
-        )
 
         grouped[key]["rows"].append(row)
 
@@ -1570,6 +1308,7 @@ def build_signals(rows, scraped_at):
 
     for key, item in grouped.items():
 
+        match_rows = item["rows"]
         groups = item["groups"]
 
         if not groups:
@@ -1586,64 +1325,40 @@ def build_signals(rows, scraped_at):
         else:
             priority = "NORMAL"
 
-        match_rows = item["rows"]
-
         first = match_rows[0]
 
-        market_descriptions = []
-        flow_targets = []
+        market_lines = []
 
         for row in match_rows:
 
-            market_descriptions.append(
-                "{} [{}] {} -> {}".format(
+            market_lines.append(
+                (
+                    "{} [{}] {} -> {} | "
+                    "Команда: {} | Напрямок: {}"
+                ).format(
                     row.get("market", ""),
                     row.get("selection", ""),
                     row.get("odds_old", ""),
-                    row.get("odds_new", "")
+                    row.get("odds_new", ""),
+                    row.get("flow_to_team", "Невизначено"),
+                    row.get("flow_direction", "Невизначено")
                 )
             )
 
-            target = row.get(
-                "flow_to_team",
-                "Невизначено"
-            )
-
-            if target not in flow_targets:
-                flow_targets.append(target)
-
         signals.append({
-
             "scraped_at": scraped_at,
-
             "teams": first.get("teams", ""),
-
             "country": first.get("country", ""),
             "league": first.get("league", ""),
-
             "match_time": first.get("match_time", ""),
-
             "market_count": count,
-
-            "market_groups": ", ".join(
-                sorted(groups)
-            ),
-
+            "market_groups": ", ".join(sorted(groups)),
             "priority": priority,
-
-            "markets": " || ".join(
-                market_descriptions
-            ),
-
-            "flow_targets": " | ".join(
-                flow_targets
-            ),
-
+            "markets": " || ".join(market_lines),
             "match_url": normalize_match_url(
                 first.get("match_url", "")
             ),
-
-            "match_key": key
+            "match_key": key,
         })
 
     order = {
@@ -1653,9 +1368,9 @@ def build_signals(rows, scraped_at):
     }
 
     signals.sort(
-        key=lambda x: (
-            order.get(x["priority"], 9),
-            x["teams"]
+        key=lambda item: (
+            order.get(item["priority"], 9),
+            item["teams"]
         )
     )
 
@@ -1663,30 +1378,26 @@ def build_signals(rows, scraped_at):
 
 
 # ============================================================
-# DEBUG
+# DEBUG OUTPUT
 # ============================================================
 
 def save_debug(data):
 
-    with open(
-        DEBUG_JSON,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
+    DEBUG_JSON.write_text(
+        json.dumps(
             data,
-            f,
             ensure_ascii=False,
             indent=2
-        )
+        ),
+        encoding="utf-8"
+    )
 
 
 def save_html_samples(cards):
 
     fragments = []
 
-    for index, card in enumerate(cards[:10]):
+    for index, card in enumerate(cards[:15]):
 
         html = card.get("html", "")
 
@@ -1696,13 +1407,101 @@ def save_html_samples(cards):
                 f"\n<!-- CARD {index + 1} -->\n{html}\n"
             )
 
-    with open(
-        DEBUG_HTML,
-        "w",
+    DEBUG_HTML.write_text(
+        "\n".join(fragments),
         encoding="utf-8"
-    ) as f:
+    )
 
-        f.write("\n".join(fragments))
+
+# ============================================================
+# SCRAPER
+# ============================================================
+
+def scrape_page():
+
+    with sync_playwright() as playwright:
+
+        browser = playwright.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ]
+        )
+
+        context = browser.new_context(
+            viewport={
+                "width": 1440,
+                "height": 1000
+            },
+            locale="en-US",
+            timezone_id="UTC",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
+        )
+
+        page = context.new_page()
+
+        page.set_default_timeout(TIMEOUT_MS)
+
+        response = page.goto(
+            SOURCE_URL,
+            wait_until="domcontentloaded",
+            timeout=TIMEOUT_MS
+        )
+
+        http_status = (
+            response.status
+            if response
+            else None
+        )
+
+        page.wait_for_timeout(6000)
+
+        try:
+
+            page.wait_for_selector(
+                'a[href*="/football/h2h/"]',
+                timeout=20000
+            )
+
+        except Exception:
+
+            log.warning(
+                "Match links did not appear before timeout."
+            )
+
+        extracted = page.evaluate(
+            EXTRACT_CARDS_JS
+        )
+
+        result = {
+            "http_status": http_status,
+            "page_title": page.title(),
+            "final_url": page.url,
+            "cards": extracted.get("cards", []),
+            "match_links_found": extracted.get(
+                "match_links_found", 0
+            ),
+            "unique_match_links": extracted.get(
+                "unique_match_links", 0
+            ),
+            "pagination_links": extracted.get(
+                "pagination_links", []
+            ),
+            "body_text": clean_text(
+                page.locator("body").inner_text()
+            )[:3000],
+        }
+
+        context.close()
+        browser.close()
+
+        return result
 
 
 # ============================================================
@@ -1728,7 +1527,7 @@ def main():
 
     save_html_samples(cards)
 
-    seen_market = set()
+    seen = set()
 
     for index, card in enumerate(cards):
 
@@ -1742,61 +1541,49 @@ def main():
             if error:
 
                 parse_failures.append({
-
                     "card": index + 1,
-
                     "reason": error,
-
                     "anchor_text": clean_text(
                         card.get("anchorText", "")
                     )[:300],
-
                     "card_text": clean_text(
                         card.get("text", "")
-                    )[:700]
+                    )[:700],
                 })
 
                 continue
 
             duplicate_key = (
-
                 row["match_key"],
-
                 row["market_code"],
-
                 row["selection_code"],
-
-                row["handicap_line"]
+                row["handicap_line"],
+                row["odds_old"],
+                row["odds_new"],
             )
 
-            if duplicate_key in seen_market:
+            if duplicate_key in seen:
 
                 parse_failures.append({
-
                     "card": index + 1,
-
                     "reason": "duplicate_match_market",
-
-                    "anchor_text": row["teams"]
+                    "anchor_text": row["teams"],
                 })
 
                 continue
 
-            seen_market.add(duplicate_key)
+            seen.add(duplicate_key)
 
             rows.append(row)
 
         except Exception as exc:
 
             parse_failures.append({
-
                 "card": index + 1,
-
-                "reason": str(exc),
-
+                "reason": repr(exc),
                 "anchor_text": clean_text(
                     card.get("anchorText", "")
-                )[:300]
+                )[:300],
             })
 
     qualifying_rows = [
@@ -1810,12 +1597,14 @@ def main():
         scraped_at
     )
 
+    # Current snapshot.
     write_csv(
         LATEST_CSV,
         rows,
         CSV_FIELDS
     )
 
+    # Preserve and append only newly recorded qualifying movements.
     new_history_rows = save_history(rows)
 
     append_csv(
@@ -1831,16 +1620,26 @@ def main():
     )
 
     missing_country = sum(
-        1 for row in rows
-        if not row.get("country")
+        not row.get("country")
+        for row in rows
     )
 
     missing_league = sum(
-        1 for row in rows
-        if not row.get("league")
+        not row.get("league")
+        for row in rows
     )
 
-    market_group_counts = {}
+    missing_time = sum(
+        not row.get("match_time")
+        for row in rows
+    )
+
+    missing_teams = sum(
+        not row.get("teams")
+        for row in rows
+    )
+
+    group_counts = {}
 
     for row in rows:
 
@@ -1849,8 +1648,8 @@ def main():
             "other"
         )
 
-        market_group_counts[group] = (
-            market_group_counts.get(group, 0) + 1
+        group_counts[group] = (
+            group_counts.get(group, 0) + 1
         )
 
     duration = round(
@@ -1859,92 +1658,50 @@ def main():
     )
 
     debug = {
-
         "started_at": scraped_at,
-
         "url": SOURCE_URL,
-
-        "http_status": result.get("http_status"),
-
-        "page_title": result.get("page_title", ""),
-
-        "final_url": result.get("final_url", ""),
-
-        "match_links_found": result.get(
-            "match_links_found",
-            0
-        ),
-
-        "unique_match_links": result.get(
-            "unique_match_links",
-            0
-        ),
-
+        "http_status": result["http_status"],
+        "page_title": result["page_title"],
+        "final_url": result["final_url"],
+        "match_links_found": result["match_links_found"],
+        "unique_match_links": result["unique_match_links"],
         "cards_found": len(cards),
-
         "parsed_rows": len(rows),
-
         "qualifying_rows": len(qualifying_rows),
-
         "signals": len(signals),
-
         "new_database_records": len(new_history_rows),
-
         "missing_country": missing_country,
-
         "missing_league": missing_league,
-
-        "market_group_counts": market_group_counts,
-
-        "pagination_links": result.get(
-            "pagination_links",
-            []
-        ),
-
+        "missing_match_time": missing_time,
+        "missing_teams": missing_teams,
+        "market_group_counts": group_counts,
+        "pagination_links": result["pagination_links"],
         "parse_failures": len(parse_failures),
-
-        "parse_failure_samples": parse_failures[:30],
-
+        "parse_failure_samples": parse_failures[:40],
         "signal_samples": signals[:20],
-
+        "body_preview": result["body_text"],
         "duration_seconds": duration,
-
         "finished_at": utc_now(),
-
-        "result": "completed"
+        "result": "completed",
     }
 
     save_debug(debug)
 
-    log.info("Parsed rows: %s", len(rows))
-
     log.info(
-        "Qualifying rows: %s",
-        len(qualifying_rows)
-    )
-
-    log.info(
-        "Signals: %s",
-        len(signals)
-    )
-
-    log.info(
-        "New database records: %s",
+        "Cards=%s Parsed=%s Qualifying=%s Signals=%s NewDB=%s",
+        len(cards),
+        len(rows),
+        len(qualifying_rows),
+        len(signals),
         len(new_history_rows)
     )
 
     log.info(
-        "Missing country: %s",
-        missing_country
-    )
-
-    log.info(
-        "Missing league: %s",
-        missing_league
-    )
-
-    log.info(
-        "Parse failures: %s",
+        "Missing teams=%s time=%s country=%s league=%s failures=%s",
+        missing_teams,
+        missing_time,
+        missing_country,
+        missing_league,
         len(parse_failures)
     )
 
