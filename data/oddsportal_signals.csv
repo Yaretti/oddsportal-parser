@@ -1,1 +1,1 @@
-﻿scraped_at,teams,country,league,match_time,market_count,market_groups,priority,markets,match_url,match_key
+﻿scraped_at,priority,teams,home_team,away_team,country,league,match_time,qualifying_groups,qualifying_group_count,flow_targets,qualifying_markets,qualifying_selections,match_url,match_key

@@ -1,41 +1,36 @@
 {
-  "started_at": "2026-11-10T15:34:58+00:00",
-  "url": "https://www.oddsportal.com/dropping-odds/",
+  "started_at": "2026-11-10T15:54:33.243061+00:00",
+  "source_url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
   "http_status": 200,
-  "page_title": "Dropping Odds – Live Updates & Betting Tips | Odds Portal",
   "final_url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
-  "match_links_found": 36,
-  "unique_match_links": 17,
-  "cards_found": 17,
-  "parsed_rows": 16,
+  "pages_scanned": 1,
+  "cards_found": 19,
+  "parsed_rows": 19,
+  "parse_failures": 0,
+  "duplicate_records": 0,
   "qualifying_rows": 0,
   "signals": 0,
-  "new_database_records": 0,
-  "missing_country": 0,
-  "missing_league": 0,
   "market_group_counts": {
+    "positive_handicap": 7,
     "total": 2,
     "other": 6,
-    "1X2": 4,
-    "positive_handicap": 4
+    "negative_handicap": 2,
+    "1X2": 2
   },
-  "pagination_links": [
-    {
-      "text": "More information",
-      "href": "https://cookiepedia.co.uk/giving-consent-to-cookies"
-    }
-  ],
-  "parse_failures": 1,
-  "parse_failure_samples": [
-    {
-      "card": 16,
-      "reason": "duplicate_match_market",
-      "anchor_text": "Chambery - Grenoble"
-    }
-  ],
-  "signal_samples": [],
+  "flow_confidence_counts": {
+    "high": 16,
+    "low": 3
+  },
   "errors": [],
-  "duration_seconds": 8.54,
-  "finished_at": "2026-11-10T15:35:07+00:00",
+  "parse_failure_samples": [],
+  "finished_at": "2026-11-10T15:54:43.553234+00:00",
+  "duration_seconds": 10.31,
+  "history_new_rows": 19,
+  "database_new_records": 19,
+  "signal_priorities": {
+    "TOP": 0,
+    "HIGH": 0,
+    "NORMAL": 0
+  },
   "result": "completed"
 }
