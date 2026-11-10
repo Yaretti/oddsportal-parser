@@ -1,19 +1,24 @@
 {
-  "started_at": "2026-11-10T17:11:31+00:00",
+  "started_at": "2026-11-10T17:30:59+00:00",
   "url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
   "http_status": 200,
   "page_title": "Dropping Odds – Live Updates & Betting Tips | Odds Portal",
   "final_url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
   "match_links_found": 40,
   "unique_match_links": 19,
-  "cards_found": 40,
-  "parsed_rows": 20,
+  "cards_found": 6,
+  "parsed_rows": 3,
   "qualifying_rows": 0,
   "signals": 0,
-  "new_database_records": 20,
-  "history_policy": "all_valid_parsed_rows",
-  "positive_handicap_in_history": true,
-  "positive_handicap_in_signals": false,
+  "new_database_records": 3,
+  "allowed_market_codes": [
+    "1x2",
+    "ou",
+    "over-under",
+    "total"
+  ],
+  "history_policy": "new records only for 1X2 and Total; existing records preserved",
+  "signal_policy": "one NORMAL signal per match if at least one qualifying 1X2 or Total row exists; FT only",
   "signal_periods": [
     "FT"
   ],
@@ -26,16 +31,11 @@
     "selection": 0
   },
   "market_group_counts": {
-    "negative_handicap": 7,
-    "other": 8,
-    "1X2": 3,
-    "positive_handicap": 1,
-    "total": 1
+    "total": 1,
+    "1X2": 2
   },
   "period_counts": {
-    "FT": 15,
-    "1H": 4,
-    "2H": 1
+    "FT": 3
   },
   "pagination_links": [
     {
@@ -43,112 +43,27 @@
       "href": "https://cookiepedia.co.uk/giving-consent-to-cookies"
     }
   ],
-  "parse_failures": 20,
+  "parse_failures": 3,
   "parse_failure_samples": [
     {
-      "card": 21,
+      "card": 4,
+      "reason": "exact_duplicate_row",
+      "anchor_text": "Once Caldas - Atl. Nacional"
+    },
+    {
+      "card": 5,
       "reason": "exact_duplicate_row",
       "anchor_text": "Colchester - Ipswich U21"
     },
     {
-      "card": 22,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 23,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 24,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 25,
+      "card": 6,
       "reason": "exact_duplicate_row",
       "anchor_text": "Chambery - Grenoble"
-    },
-    {
-      "card": 26,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 27,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 28,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 29,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 30,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 31,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Chambery - Grenoble"
-    },
-    {
-      "card": 32,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 33,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Tavernes - Valencia"
-    },
-    {
-      "card": 34,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Chambery - Grenoble"
-    },
-    {
-      "card": 35,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Chambery - Grenoble"
-    },
-    {
-      "card": 36,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 37,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Chambery - Grenoble"
-    },
-    {
-      "card": 38,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Tavernes - Valencia"
-    },
-    {
-      "card": 39,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
-    },
-    {
-      "card": 40,
-      "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
     }
   ],
   "signal_samples": [],
-  "body_preview": "Decimal Odds Decimal Odds (1.50) Fractional Odds (1/2) Money Line Odds (-200) Hong Kong Odds (0.50) Malay Odds (0.50) Indonesian Odds (-2.00) English English Polski LOGIN REGISTER ODDS COMPARISON COMMUNITY BOOKMAKERS Bet $5 Daily, Get Up To $350 In Bet Resets! CLAIM To claim, new users need to register, make a first-time deposit of $5 or more, and then simply place their first real-money wager on any FanDuel Sportsbook market (no odds limits) that is live on platform. All users will receive their $150 in Bonus Bets If Your Bet Wins within 72 hours of the bet settlement. HOME DROPPING ODDS SURE BETS BETTING TOOLS BETTING MY LEAGUES 0 Manage my leagues FOOTBALL Today's matches Popular LaLiga (21) Premier League (20) Bundesliga (19) Serie A (20) Champions League (18) Europa League (18) Ligue 1 (18) Euro U21 (4) All countries BASKETBALL TENNIS BASEBALL HOCKEY AMERICAN FOOTBALL AUSSIE RULES BADMINTON BANDY BOXING CRICKET DARTS ESPORTS FLOORBALL FUTSAL HANDBALL MMA RUGBY LEAGUE RUGBY UNION SNOOKER VOLLEYBALL WATER POLO Get up to $1,500 paid back in bonus bets, if you don`t win ! CLAIM Gambling problem? Call 1-800-GAMBLER or 1-800-MY-RESET. 21+ only. Please Gamble Responsibly. See BetMGM.com for Terms. First Bet Offer for new customers only (if applicable). Subject to eligibility requirements. Bonus bets are non-withdrawable. In partnership with Kansas Crossing Casino and Hotel. Promotional offers not available in Mississippi, New York, Ontario, or Puerto Rico. Bet $10 Get $200 Win or Lose CLAIM No matter if your bet wins or loses. Deposit required. Paid in Bonus Bets. Bonus Bets wager excluded from returns. New customers only. Max. prize, game restrictions, time limits and T&Cs apply. 21+. Gambling Problem? Call 1-800-GAMBLER. BET $20 GET $350 Fancash CLAIM New Customers Only. 21+. T&Cs Apply Home > Dropping Odds Dropping Odds Dropping odds with OddsPortal enables you to find the online bookmakers that have not yet noticed that there have been big price changes in certain markets with other betting sites. Odds could be dropping due to a player injury or illness throughout a team, or because one team has potentially decided to play a weaker side ahead of a game. Some online betting sites may take notice, while others may not, allowing you to take advantage before there is any odds movement with certain bookmakers. Check out our page today for all of the best dropping odds tips across several different markets, while you can even filter it to a specific market or sport you are interested in. Filter Last 1 hour Last 12 hours Last 24 hours 10% dropping bookies 20% dropping bookies 30% dropping bookies 40% dropping bookies 50% dropping bookies All types 1X2 Over/Under 1X2 FT Only Home/Away Double Chance Asian Handicap Draw No Bet To Qualify Half Time / Full Time Odd or Even European Handicap Both Teams to Score All sports Football Basketball Tennis Handball Football / England / EFL Trophy EH +3 2 Best Current Odds Today 19:45 Colchester - Ipswich U21 -65% 4",
-  "duration_seconds": 8.9,
-  "finished_at": "2026-11-10T17:11:40+00:00",
+  "body_preview": "Decimal Odds Decimal Odds (1.50) Fractional Odds (1/2) Money Line Odds (-200) Hong Kong Odds (0.50) Malay Odds (0.50) Indonesian Odds (-2.00) English English Polski LOGIN REGISTER ODDS COMPARISON COMMUNITY BOOKMAKERS Bet $5 Daily, Get Up To $350 In Bet Resets! CLAIM To claim, new users need to register, make a first-time deposit of $5 or more, and then simply place their first real-money wager on any FanDuel Sportsbook market (no odds limits) that is live on platform. All users will receive their $150 in Bonus Bets If Your Bet Wins within 72 hours of the bet settlement. HOME DROPPING ODDS SURE BETS BETTING TOOLS BETTING MY LEAGUES 0 Manage my leagues FOOTBALL Today's matches Popular LaLiga (21) Premier League (20) Bundesliga (19) Serie A (20) Champions League (18) Europa League (18) Ligue 1 (18) Euro U21 (4) All countries BASKETBALL TENNIS BASEBALL HOCKEY AMERICAN FOOTBALL AUSSIE RULES BADMINTON BANDY BOXING CRICKET DARTS ESPORTS FLOORBALL FUTSAL HANDBALL MMA RUGBY LEAGUE RUGBY UNION SNOOKER VOLLEYBALL WATER POLO Bet $5 Daily, Get Up To $350 In Bet Resets! CLAIM To claim, new users need to register, make a first-time deposit of $5 or more, and then simply place their first real-money wager on any FanDuel Sportsbook market (no odds limits) that is live on platform. All users will receive their $150 in Bonus Bets If Your Bet Wins within 72 hours of the bet settlement. Get up to $1,500 paid back in bonus bets, if you don`t win ! CLAIM Gambling problem? Call 1-800-GAMBLER or 1-800-MY-RESET. 21+ only. Please Gamble Responsibly. See BetMGM.com for Terms. First Bet Offer for new customers only (if applicable). Subject to eligibility requirements. Bonus bets are non-withdrawable. In partnership with Kansas Crossing Casino and Hotel. Promotional offers not available in Mississippi, New York, Ontario, or Puerto Rico. BET $20 GET $350 Fancash CLAIM New Customers Only. 21+. T&Cs Apply Home > Dropping Odds Dropping Odds Dropping odds with OddsPortal enables you to find the online bookmakers that have not yet noticed that there have been big price changes in certain markets with other betting sites. Odds could be dropping due to a player injury or illness throughout a team, or because one team has potentially decided to play a weaker side ahead of a game. Some online betting sites may take notice, while others may not, allowing you to take advantage before there is any odds movement with certain bookmakers. Check out our page today for all of the best dropping odds tips across several different markets, while you can even filter it to a specific market or sport you are interested in. Filter Last 1 hour Last 12 hours Last 24 hours 10% dropping bookies 20% dropping bookies 30% dropping bookies 40% dropping bookies 50% dropping bookies All types 1X2 Over/Under 1X2 FT Only Home/Away Double Chance Asian Handicap Draw No Bet To Qualify Half Time / Full Time Odd or Even European Handicap Both Teams to Score All sports Football Basketball Tennis Handball Football / En",
+  "duration_seconds": 8.41,
+  "finished_at": "2026-11-10T17:31:08+00:00",
   "result": "completed"
 }
