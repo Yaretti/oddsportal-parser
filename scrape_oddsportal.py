@@ -1,29 +1,39 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
 GREENLINE / OddsPortal Dropping Odds Parser
 
-Критерії відбору:
-1. Початковий коефіцієнт 4.00-5.00 включно, новий <= 2.00.
-2. Початковий коефіцієнт 2.00-3.00 включно, новий <= 1.80.
+Дозволені ринки:
+- 1X2
+- Over/Under (Total)
 
-Пріоритет:
-NORMAL = одна цільова група
-HIGH   = дві цільові групи
-TOP    = 1X2 + негативна фора + тотал
+Виключені:
+- AH
+- EH
+- DNB
+- HT/FT
+- To Qualify
+- усі інші ринки
 
-Позитивна фора:
-- зберігається в історії;
-- не потрапляє до сигналів;
-- не враховується в пріоритеті.
+Критерії:
+1. Початковий коефіцієнт 4.00-5.00 включно,
+   новий коефіцієнт <= 2.00.
+2. Початковий коефіцієнт 2.00-3.00 включно,
+   новий коефіцієнт <= 1.80.
 
-Фора вважається негативною/позитивною для ВИБРАНОЇ команди:
-лінія в заголовку подана з погляду господарів, тому для вибору "2"
-знак лінії інвертується.
+Сигнал:
+- достатньо проходження хоча б одного критерію;
+- якщо 1X2 і Total пройшли одночасно,
+  створюється один сигнал;
+- усі сигнали мають пріоритет NORMAL;
+- сигнали формуються лише для FT.
 
-Сигнали формуються лише для повного часу (period == FT).
-Інші періоди (1H, 2H) лишаються в історії.
+Історія:
+- нові записи додаються тільки для 1X2 і Total;
+- старі записи не видаляються;
+- 1H і 2H зберігаються в історії, але не йдуть у сигнали.
 
 Рух коефіцієнта не є доказом грошового потоку.
 """
@@ -69,15 +79,22 @@ DATABASE_FILE = DATA_DIR / "oddsportal_history.sqlite"
 DEBUG_JSON = DATA_DIR / "oddsportal_debug.json"
 DEBUG_HTML = DATA_DIR / "oddsportal_cards_debug.html"
 
-TARGET_SIGNAL_GROUPS = {"1X2", "negative_handicap", "total"}
+# ЄДИНІ дозволені ринки.
+ALLOWED_MARKET_CODES = {
+    "1x2",
+    "over-under",
+    "ou",
+    "total",
+}
 
-# У сигнали йдуть лише ці періоди. Додайте "1H" / "2H", якщо потрібно.
+TARGET_SIGNAL_GROUPS = {"1X2", "total"}
 SIGNAL_PERIODS = {"FT"}
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
+
 log = logging.getLogger("oddsportal")
 
 
@@ -112,6 +129,7 @@ def utc_now():
 def clean_text(value):
     if value is None:
         return ""
+
     return re.sub(
         r"\s+", " ", str(value).replace("\xa0", " ")
     ).strip()
@@ -133,23 +151,35 @@ def normalize_team_name(value):
 def normalize_match_url(url):
     if not url:
         return ""
+
     parts = urlsplit(url)
+
     return urlunsplit((
-        parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""
+        parts.scheme,
+        parts.netloc,
+        parts.path.rstrip("/"),
+        "",
+        ""
     ))
 
 
 def make_match_key(teams, match_url):
     normalized_url = normalize_match_url(match_url)
+
     if normalized_url:
         return normalized_url.lower()
+
     return normalize_team_name(teams)
 
 
 def make_record_key(row):
-    # Ключ розрізняє ринок, період, вибір, лінію і конкретний рух.
-    # best_current_odds навмисно НЕ входить: воно змінюється
-    # щоразу і створювало б хибні "нові" записи.
+    """
+    Ключ розрізняє ринок, період, вибір
+    та конкретний рух коефіцієнта.
+
+    best_current_odds не входить до ключа,
+    оскільки це значення може змінюватися.
+    """
 
     keys = [
         "match_key",
@@ -166,7 +196,38 @@ def make_record_key(row):
     ]
 
     raw = "|".join(str(row.get(key, "")) for key in keys)
+
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# MARKET FILTER
+# ============================================================
+
+def get_market_code_from_url(url):
+    """
+    Витягує код ринку з фрагмента URL.
+    Дозволяє тільки 1X2 та Over/Under.
+    """
+
+    if not url or "#" not in url:
+        return ""
+
+    fragment = url.split("#", 1)[1]
+
+    if ":" not in fragment:
+        return ""
+
+    tokens = fragment.split(":", 1)[1].split(";")
+
+    if not tokens:
+        return ""
+
+    return tokens[0].strip().lower()
+
+
+def is_allowed_market(url):
+    return get_market_code_from_url(url) in ALLOWED_MARKET_CODES
 
 
 # ============================================================
@@ -176,8 +237,10 @@ def make_record_key(row):
 def calculate_drop(old_odds, new_odds):
     if old_odds is None or new_odds is None:
         return None
+
     if old_odds <= 0:
         return None
+
     return ((new_odds - old_odds) / old_odds) * 100
 
 
@@ -188,10 +251,21 @@ def validate_drop(old_odds, new_odds, displayed_drop):
         return False, calculated
 
     valid = abs(calculated - displayed_drop) <= DROP_TOLERANCE_PP
+
     return valid, calculated
 
 
 def qualifies_odds(old_odds, new_odds):
+    """
+    Критерій 1:
+    початковий коефіцієнт 4.00-5.00 включно,
+    новий коефіцієнт <= 2.00.
+
+    Критерій 2:
+    початковий коефіцієнт 2.00-3.00 включно,
+    новий коефіцієнт <= 1.80.
+    """
+
     if old_odds is None or new_odds is None:
         return False
 
@@ -206,29 +280,37 @@ def qualifies_odds(old_odds, new_odds):
 
 def parse_drop_percentage(text):
     matches = re.findall(
-        r"[-−]\s*(\d{1,3}(?:[.,]\d+)?)\s*%", text or ""
+        r"[-−]\s*(\d{1,3}(?:[.,]\d+)?)\s*%",
+        text or ""
     )
+
     if not matches:
         return None
+
     value = safe_float(matches[0])
+
     if value is None:
         return None
+
     return -abs(value)
 
 
 def parse_best_odds_from_text(text):
-    # Запасний варіант, якщо DOM-селектор нічого не знайшов.
     found = re.search(
         r"Best Current Odds\D{0,20}(\d{1,4}[.,]\d{1,3})",
-        text or "", re.IGNORECASE
+        text or "",
+        re.IGNORECASE
     )
+
     if found:
         return safe_float(found.group(1))
 
     found = re.search(
         r"(\d{1,4}[.,]\d{1,3})\D{0,20}Best Current Odds",
-        text or "", re.IGNORECASE
+        text or "",
+        re.IGNORECASE
     )
+
     return safe_float(found.group(1)) if found else None
 
 
@@ -241,7 +323,7 @@ def parse_market_from_url(url):
         "market": "",
         "market_code": "",
         "market_group": "other",
-        "selection_code": "",   # другий токен URL = код періоду (scope)
+        "selection_code": "",
         "selection": "",
         "handicap_line": "",
     }
@@ -266,41 +348,19 @@ def parse_market_from_url(url):
     result["selection_code"] = scope_code
 
     if code == "1x2":
-        result.update(market="1X2", market_group="1X2")
-
-    elif code in ("over-under", "ou", "total"):
-        result.update(market="Total", market_group="total")
-        if len(tokens) > 2:
-            result["handicap_line"] = tokens[2]
-
-    elif code in ("ah", "eh"):
-        result["market"] = (
-            "Asian Handicap" if code == "ah" else "European Handicap"
+        result.update(
+            market="1X2",
+            market_group="1X2"
         )
 
-        line = ""
-        for token in tokens[2:]:
-            if safe_float(token) is not None:
-                line = token
-                break
+    elif code in ("over-under", "ou", "total"):
+        result.update(
+            market="Total",
+            market_group="total"
+        )
 
-        result["handicap_line"] = line
-
-        # Група остаточно визначається в parse_card
-        # з урахуванням вибору (1 або 2).
-        result["market_group"] = "other"
-
-    elif code == "dnb":
-        result["market"] = "DNB"
-
-    elif code == "ht-ft":
-        result["market"] = "HT/FT"
-
-    elif code == "qualify":
-        result["market"] = "To Qualify"
-
-    else:
-        result["market"] = code.upper()
+        if len(tokens) > 2:
+            result["handicap_line"] = tokens[2]
 
     return result
 
@@ -309,15 +369,12 @@ def detect_market_label(text, fallback):
     patterns = [
         r"O/U\s*\d+(?:[.,]\d+)?",
         r"Over\s*/\s*Under",
-        r"HT\s*/\s*FT",
         r"1X2",
-        r"AH\s*[+-]?\d+(?:[.,]\d+)?",
-        r"EH\s*[+-]?\d+(?:[.,]\d+)?",
-        r"DNB",
     ]
 
     for pattern in patterns:
         found = re.search(pattern, text or "", re.IGNORECASE)
+
         if found:
             return clean_text(found.group(0))
 
@@ -329,10 +386,14 @@ def detect_period(label, scope_code):
 
     if "1st half" in low:
         return "1H"
+
     if "2nd half" in low:
         return "2H"
 
-    return {"3": "1H", "4": "2H"}.get(str(scope_code), "FT")
+    return {
+        "3": "1H",
+        "4": "2H",
+    }.get(str(scope_code), "FT")
 
 
 def normalize_selection(value):
@@ -350,60 +411,9 @@ def normalize_selection(value):
         "1": "1",
         "x": "X",
         "2": "2",
-        "1x": "1X",
-        "x2": "X2",
-        "12": "12",
     }
 
     return aliases.get(low, value)
-
-
-# ============================================================
-# HANDICAP DIRECTION
-# ============================================================
-
-def parse_handicap_line_from_label(label):
-    found = re.search(
-        r"\b(?:AH|EH)\s*([+-]?\d+(?:[.,]\d+)?)",
-        label or "", re.IGNORECASE
-    )
-    if not found:
-        return ""
-    return found.group(1).replace(",", ".")
-
-
-def effective_handicap_line(line, selection):
-    """
-    Лінія в заголовку подана з погляду господарів.
-    Для вибору "2" (гості) знак інвертується.
-    Невідомий вибір -> None (не вважаємо негативною).
-    """
-
-    number = safe_float(line)
-
-    if number is None:
-        return None
-
-    if selection in ("1", "Home"):
-        return number
-
-    if selection in ("2", "Away"):
-        return -number
-
-    return None
-
-
-def classify_handicap(line, selection):
-    effective = effective_handicap_line(line, selection)
-
-    if effective is None:
-        return "other"
-    if effective < 0:
-        return "negative_handicap"
-    if effective > 0:
-        return "positive_handicap"
-
-    return "other"
 
 
 # ============================================================
@@ -462,30 +472,56 @@ def detect_flow_direction(selection, market_group, home, away):
 # ============================================================
 
 COUNTRY_NAMES = {
-    "england": "England", "scotland": "Scotland", "wales": "Wales",
-    "northern-ireland": "Northern Ireland", "colombia": "Colombia",
-    "spain": "Spain", "france": "France", "germany": "Germany",
-    "italy": "Italy", "portugal": "Portugal", "brazil": "Brazil",
-    "argentina": "Argentina", "netherlands": "Netherlands",
-    "belgium": "Belgium", "turkey": "Turkey", "greece": "Greece",
-    "ukraine": "Ukraine", "poland": "Poland",
-    "czech-republic": "Czech Republic", "croatia": "Croatia",
-    "serbia": "Serbia", "romania": "Romania", "bulgaria": "Bulgaria",
-    "denmark": "Denmark", "sweden": "Sweden", "norway": "Norway",
-    "finland": "Finland", "usa": "USA", "united-states": "USA",
-    "mexico": "Mexico", "japan": "Japan", "south-korea": "South Korea",
-    "china": "China", "australia": "Australia", "india": "India",
-    "international": "International", "world": "International",
+    "england": "England",
+    "scotland": "Scotland",
+    "wales": "Wales",
+    "northern-ireland": "Northern Ireland",
+    "colombia": "Colombia",
+    "spain": "Spain",
+    "france": "France",
+    "germany": "Germany",
+    "italy": "Italy",
+    "portugal": "Portugal",
+    "brazil": "Brazil",
+    "argentina": "Argentina",
+    "netherlands": "Netherlands",
+    "belgium": "Belgium",
+    "turkey": "Turkey",
+    "greece": "Greece",
+    "ukraine": "Ukraine",
+    "poland": "Poland",
+    "czech-republic": "Czech Republic",
+    "croatia": "Croatia",
+    "serbia": "Serbia",
+    "romania": "Romania",
+    "bulgaria": "Bulgaria",
+    "denmark": "Denmark",
+    "sweden": "Sweden",
+    "norway": "Norway",
+    "finland": "Finland",
+    "usa": "USA",
+    "united-states": "USA",
+    "mexico": "Mexico",
+    "japan": "Japan",
+    "south-korea": "South Korea",
+    "china": "China",
+    "australia": "Australia",
+    "india": "India",
+    "international": "International",
+    "world": "International",
 }
 
 
 def slug_to_title(slug):
     if not slug:
         return ""
+
     if slug in COUNTRY_NAMES:
         return COUNTRY_NAMES[slug]
+
     return " ".join(
-        word.capitalize() for word in slug.replace("_", "-").split("-")
+        word.capitalize()
+        for word in slug.replace("_", "-").split("-")
     )
 
 
@@ -518,7 +554,10 @@ def extract_country_league(links):
     if not candidates:
         return "", "", ""
 
-    chosen = max(candidates, key=lambda item: len(item["path"]))
+    chosen = max(
+        candidates,
+        key=lambda item: len(item["path"])
+    )
 
     return (
         slug_to_title(chosen["country_slug"]),
@@ -544,13 +583,14 @@ def parse_match_time_and_teams(anchor_text, card_text=""):
 
     match_time = ""
 
-    # Спочатку текст посилання, бо там час саме цього матчу.
     for source in (anchor_text, card_text):
         for pattern in TIME_PATTERNS:
             found = re.search(pattern, source, re.IGNORECASE)
+
             if found:
                 match_time = clean_text(found.group(0))
                 break
+
         if match_time:
             break
 
@@ -561,13 +601,19 @@ def parse_match_time_and_teams(anchor_text, card_text=""):
 
     for line in lines:
         line = re.sub(
-            r"\b(?:Today|Tomorrow|Yesterday)\b", "", line,
+            r"\b(?:Today|Tomorrow|Yesterday)\b",
+            "",
+            line,
             flags=re.IGNORECASE
         )
+
         line = re.sub(
-            r"\b\d{1,2}\s+[A-Za-z]{3,9}\b", "", line,
+            r"\b\d{1,2}\s+[A-Za-z]{3,9}\b",
+            "",
+            line,
             flags=re.IGNORECASE
         )
+
         line = re.sub(r"\b\d{1,2}:\d{2}\b", "", line)
         line = clean_text(line)
 
@@ -576,12 +622,16 @@ def parse_match_time_and_teams(anchor_text, card_text=""):
 
     for line in cleaned:
         parts = re.split(
-            r"\s+(?:-|–|—|vs\.?)\s+", line,
-            maxsplit=1, flags=re.IGNORECASE
+            r"\s+(?:-|–|—|vs\.?)\s+",
+            line,
+            maxsplit=1,
+            flags=re.IGNORECASE
         )
+
         if len(parts) == 2:
             home = clean_text(parts[0])
             away = clean_text(parts[1])
+
             if home and away:
                 return f"{home} - {away}", match_time
 
@@ -607,9 +657,14 @@ EXTRACT_CARDS_JS = r"""
 
   const output = [];
 
-  // Дедуплікація за вузлом картки, а НЕ за href:
-  // різні вибори одного ринку (1 / X / 2) мають однаковий href.
   const seenCards = new Set();
+
+  const allowedMarkets = new Set([
+    "1x2",
+    "over-under",
+    "ou",
+    "total"
+  ]);
 
   const txt = el => (
     el && (el.innerText || el.textContent) || ""
@@ -621,9 +676,8 @@ EXTRACT_CARDS_JS = r"""
   };
 
   const selectionAllowed = new Set([
-    "1", "X", "2", "1X", "X2", "12",
-    "Over", "Under", "Home", "Away", "Draw",
-    "1/1", "1/X", "1/2", "X/1", "X/X", "X/2", "2/1", "2/X", "2/2"
+    "1", "X", "2",
+    "Over", "Under", "Home", "Away", "Draw"
   ]);
 
   const emptyRow = (href, anchor) => ({
@@ -648,6 +702,14 @@ EXTRACT_CARDS_JS = r"""
     const href = anchor.href || anchor.getAttribute("href") || "";
 
     if (!href) continue;
+
+    // Фільтр ринків виконується ще до пошуку картки.
+    const fragment = href.split("#")[1] || "";
+    const marketPart = fragment.includes(":")
+      ? fragment.split(":").slice(1).join(":").split(";")[0].toLowerCase()
+      : "";
+
+    if (!allowedMarkets.has(marketPart)) continue;
 
     let card = null;
     let movementLi = null;
@@ -674,10 +736,12 @@ EXTRACT_CARDS_JS = r"""
           'img[class*="dropping_rec"], ' +
           '.dropping_rec'
         );
+
         if (!marker) return false;
 
         const spans = Array.from(li.querySelectorAll("span"))
-          .map(txt).filter(isDecimal);
+          .map(txt)
+          .filter(isDecimal);
 
         return spans.length >= 2;
       });
@@ -685,8 +749,11 @@ EXTRACT_CARDS_JS = r"""
       if (candidate) {
         card = node;
         movementLi = candidate;
-        movementSpans = Array.from(candidate.querySelectorAll("span"))
-          .map(txt).filter(isDecimal);
+
+        movementSpans = Array.from(
+          candidate.querySelectorAll("span")
+        ).map(txt).filter(isDecimal);
+
         break;
       }
     }
@@ -702,12 +769,14 @@ EXTRACT_CARDS_JS = r"""
     const oldOdds = movementSpans[0];
     const newOdds = movementSpans[movementSpans.length - 1];
 
-    // Best Current Odds: у наступному <li> число лежить в <a>, не в <span>.
+    // Залишено попередню логіку отримання Best Current Odds.
     let bestOdds = "";
 
     const lis = Array.from(card.querySelectorAll("li"));
     const movementIndex = lis.indexOf(movementLi);
-    const nextLi = movementIndex >= 0 ? lis[movementIndex + 1] : null;
+    const nextLi = movementIndex >= 0
+      ? lis[movementIndex + 1]
+      : null;
 
     if (nextLi) {
       const nextNumbers = Array.from(
@@ -719,19 +788,21 @@ EXTRACT_CARDS_JS = r"""
       }
     }
 
-    // Назва команд з тегів <p> у посиланні (порядок = господарі, гості).
-    const teamNames = Array.from(anchor.querySelectorAll("p"))
-      .map(txt).filter(Boolean);
+    const teamNames = Array.from(
+      anchor.querySelectorAll("p")
+    ).map(txt).filter(Boolean);
 
     const home = teamNames[0] || "";
     const away = teamNames[1] || "";
 
-    // Назва ринку з заголовка картки (включно з "1st Half").
     let marketLabel = "";
-    const labelEl = card.querySelector("div.truncate.pl-2");
-    if (labelEl) marketLabel = txt(labelEl);
 
-    // Вибір з title видимої колонки.
+    const labelEl = card.querySelector("div.truncate.pl-2");
+
+    if (labelEl) {
+      marketLabel = txt(labelEl);
+    }
+
     let selection = "";
 
     for (const el of Array.from(card.querySelectorAll("[title]"))) {
@@ -741,7 +812,8 @@ EXTRACT_CARDS_JS = r"""
       if (!value || /Best Current Odds/i.test(value)) continue;
 
       const normalized = (
-        value.charAt(0).toUpperCase() + value.slice(1).toLowerCase()
+        value.charAt(0).toUpperCase()
+        + value.slice(1).toLowerCase()
       );
 
       if (
@@ -754,7 +826,9 @@ EXTRACT_CARDS_JS = r"""
       }
     }
 
-    const links = Array.from(card.querySelectorAll("a")).map(a => ({
+    const links = Array.from(
+      card.querySelectorAll("a")
+    ).map(a => ({
       href: a.href || a.getAttribute("href") || "",
       text: a.innerText || ""
     }));
@@ -781,7 +855,9 @@ EXTRACT_CARDS_JS = r"""
     a => a.href || a.getAttribute("href") || ""
   );
 
-  const pagination = Array.from(document.querySelectorAll("a[href]"))
+  const pagination = Array.from(
+    document.querySelectorAll("a[href]")
+  )
     .filter(a =>
       /next|more|load more/i.test((a.innerText || "").trim())
       || /page=\d+/i.test(a.href || "")
@@ -807,6 +883,11 @@ EXTRACT_CARDS_JS = r"""
 
 def parse_card(card, scraped_at):
     href = card.get("href", "")
+
+    # Повторний захист на Python-рівні.
+    if not is_allowed_market(href):
+        return None, "unsupported_market"
+
     text = card.get("text", "")
     anchor_text = card.get("anchorText", "")
 
@@ -829,7 +910,9 @@ def parse_card(card, scraped_at):
         return None, "exact_old_new_odds_not_found"
 
     valid_drop, calculated_drop = validate_drop(
-        old_odds, new_odds, displayed_drop
+        old_odds,
+        new_odds,
+        displayed_drop
     )
 
     if not valid_drop:
@@ -837,40 +920,44 @@ def parse_card(card, scraped_at):
 
     market_data = parse_market_from_url(href)
 
+    if market_data["market_code"] not in ALLOWED_MARKET_CODES:
+        return None, "unsupported_market"
+
     visible_market = clean_text(card.get("marketLabel", ""))
 
     if visible_market:
         market_data["market"] = visible_market
     else:
         market_data["market"] = detect_market_label(
-            text, market_data["market"]
+            text,
+            market_data["market"]
         )
 
     market_data["selection"] = normalize_selection(
         card.get("selection", "")
     )
 
+    # Перевіряємо допустимі варіанти вибору.
+    if market_data["market_group"] == "1X2":
+        if market_data["selection"] not in ("1", "X", "2"):
+            return None, "invalid_1x2_selection"
+
+    elif market_data["market_group"] == "total":
+        if market_data["selection"] not in ("Over", "Under"):
+            return None, "invalid_total_selection"
+
     period = detect_period(
-        market_data["market"], market_data["selection_code"]
+        market_data["market"],
+        market_data["selection_code"]
     )
-
-    # Фора: лінія з видимого заголовка, знак відносно обраної команди.
-    if market_data["market_code"] in ("ah", "eh"):
-        label_line = parse_handicap_line_from_label(market_data["market"])
-
-        if label_line:
-            market_data["handicap_line"] = label_line
-
-        market_data["market_group"] = classify_handicap(
-            market_data["handicap_line"], market_data["selection"]
-        )
 
     country, country_slug, league = extract_country_league(
         card.get("links", [])
     )
 
     fallback_teams, match_time = parse_match_time_and_teams(
-        anchor_text, text
+        anchor_text,
+        text
     )
 
     home = clean_text(card.get("home", ""))
@@ -880,12 +967,17 @@ def parse_card(card, scraped_at):
         teams = f"{home} - {away}"
     else:
         teams = fallback_teams
+
         sides = teams.split(" - ", 1) if " - " in teams else []
+
         home = sides[0] if len(sides) == 2 else ""
         away = sides[1] if len(sides) == 2 else ""
 
     flow = detect_flow_direction(
-        market_data["selection"], market_data["market_group"], home, away
+        market_data["selection"],
+        market_data["market_group"],
+        home,
+        away
     )
 
     match_key = make_match_key(teams, href)
@@ -907,12 +999,12 @@ def parse_card(card, scraped_at):
         "flow_to_team": flow["flow_to_team"],
         "flow_direction": flow["flow_direction"],
         "flow_confidence": flow["flow_confidence"],
-        "handicap_line": market_data["handicap_line"],
+        "handicap_line": "",
         "drop_pct": displayed_drop,
         "calculated_drop_pct": round(calculated_drop, 2),
         "odds_old": old_odds,
         "odds_new": new_odds,
-        "best_current_odds": best_odds,   # None -> порожнє в CSV, NULL в БД
+        "best_current_odds": best_odds,
         "qualifies": qualifies_odds(old_odds, new_odds),
         "match_url": href,
         "match_key": match_key,
@@ -928,14 +1020,20 @@ def parse_card(card, scraped_at):
 def write_csv(path, rows, fields):
     with open(path, "w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(
-            file, fieldnames=fields, extrasaction="ignore"
+            file,
+            fieldnames=fields,
+            extrasaction="ignore"
         )
+
         writer.writeheader()
         writer.writerows(rows)
 
 
 def ensure_csv_header(path, fields):
-    """Міграція: якщо заголовок старий (без нових колонок), переписуємо файл."""
+    """
+    Якщо структура CSV змінилася, переносимо старі записи
+    у новий формат, не видаляючи їх.
+    """
 
     if not path.exists() or path.stat().st_size == 0:
         return
@@ -961,7 +1059,9 @@ def append_csv(path, rows, fields):
 
     with open(path, "a", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(
-            file, fieldnames=fields, extrasaction="ignore"
+            file,
+            fieldnames=fields,
+            extrasaction="ignore"
         )
 
         if not exists:
@@ -1006,7 +1106,8 @@ DB_COLUMNS = {
 
 def initialize_database(conn):
     columns_sql = ",\n".join(
-        f"{name} {ctype}" for name, ctype in DB_COLUMNS.items()
+        f"{name} {ctype}"
+        for name, ctype in DB_COLUMNS.items()
     )
 
     conn.execute(f"""
@@ -1054,27 +1155,42 @@ def save_history(rows):
 
         for row in rows:
 
-            # Тут немає фільтра qualifies:
-            # записуються всі валідні картки.
+            # Додатковий захист: у нову історію
+            # записуються лише дозволені ринки.
+            if row.get("market_code") not in ALLOWED_MARKET_CODES:
+                continue
 
             record_key = make_record_key(row)
 
             exists = conn.execute(
-                "SELECT 1 FROM odds_history WHERE record_key = ? LIMIT 1",
+                """
+                SELECT 1
+                FROM odds_history
+                WHERE record_key = ?
+                LIMIT 1
+                """,
                 (record_key,)
             ).fetchone()
 
             if exists:
                 continue
 
-            values = {"record_key": record_key, **row}
+            values = {
+                "record_key": record_key,
+                **row
+            }
 
-            insert_columns = [k for k in values if k in columns]
+            insert_columns = [
+                key for key in values
+                if key in columns
+            ]
 
-            # Сумісність з додатковими NOT NULL колонками старої таблиці.
+            # Сумісність зі старими NOT NULL колонками.
             for item in table_info:
-                name, not_null = item[1], item[3]
-                default_value, primary_key = item[4], item[5]
+                name = item[1]
+                not_null = item[3]
+                default_value = item[4]
+                primary_key = item[5]
 
                 if (
                     name not in insert_columns
@@ -1085,10 +1201,20 @@ def save_history(rows):
                     insert_columns.append(name)
                     values[name] = ""
 
-            column_sql = ", ".join(f'"{c}"' for c in insert_columns)
-            placeholders = ", ".join("?" for _ in insert_columns)
+            column_sql = ", ".join(
+                f'"{column}"'
+                for column in insert_columns
+            )
 
-            params = [values.get(c) for c in insert_columns]
+            placeholders = ", ".join(
+                "?"
+                for _ in insert_columns
+            )
+
+            params = [
+                values.get(column)
+                for column in insert_columns
+            ]
 
             conn.execute(
                 f"INSERT INTO odds_history ({column_sql}) "
@@ -1099,6 +1225,7 @@ def save_history(rows):
             new_rows.append(row)
 
         conn.commit()
+
         return new_rows
 
     finally:
@@ -1110,6 +1237,15 @@ def save_history(rows):
 # ============================================================
 
 def build_signals(rows, scraped_at):
+    """
+    Один сигнал на матч, якщо пройшов хоча б один критерій.
+
+    Якщо пройшли і 1X2, і Total:
+    - сигнал все одно один;
+    - priority залишається NORMAL;
+    - market_count показує кількість груп, що пройшли.
+    """
+
     grouped = {}
 
     for row in rows:
@@ -1117,8 +1253,9 @@ def build_signals(rows, scraped_at):
         if not row.get("qualifies"):
             continue
 
-        # Позитивна фора, інші ринки та періоди поза FT
-        # у сигнали не входять.
+        if row.get("market_code") not in ALLOWED_MARKET_CODES:
+            continue
+
         if row.get("market_group") not in TARGET_SIGNAL_GROUPS:
             continue
 
@@ -1130,40 +1267,39 @@ def build_signals(rows, scraped_at):
         if not key:
             continue
 
-        item = grouped.setdefault(key, {"rows": [], "groups": set()})
+        item = grouped.setdefault(
+            key,
+            {
+                "rows": [],
+                "groups": set()
+            }
+        )
+
         item["rows"].append(row)
         item["groups"].add(row["market_group"])
 
     signals = []
 
     for key, item in grouped.items():
+
         match_rows = item["rows"]
         groups = item["groups"]
 
         if not groups:
             continue
 
-        count = len(groups)
-
-        if count == 3:
-            priority = "TOP"
-        elif count == 2:
-            priority = "HIGH"
-        else:
-            priority = "NORMAL"
-
         first = match_rows[0]
 
         market_lines = [
             "{} [{}] {} -> {} | Команда: {} | Напрямок: {}".format(
-                r.get("market", ""),
-                r.get("selection", ""),
-                r.get("odds_old", ""),
-                r.get("odds_new", ""),
-                r.get("flow_to_team", "Невизначено"),
-                r.get("flow_direction", "Невизначено"),
+                row.get("market", ""),
+                row.get("selection", ""),
+                row.get("odds_old", ""),
+                row.get("odds_new", ""),
+                row.get("flow_to_team", "Невизначено"),
+                row.get("flow_direction", "Невизначено"),
             )
-            for r in match_rows
+            for row in match_rows
         ]
 
         signals.append({
@@ -1172,18 +1308,18 @@ def build_signals(rows, scraped_at):
             "country": first.get("country", ""),
             "league": first.get("league", ""),
             "match_time": first.get("match_time", ""),
-            "market_count": count,
+            "market_count": len(groups),
             "market_groups": ", ".join(sorted(groups)),
-            "priority": priority,
+            "priority": "NORMAL",
             "markets": " || ".join(market_lines),
-            "match_url": normalize_match_url(first.get("match_url", "")),
+            "match_url": normalize_match_url(
+                first.get("match_url", "")
+            ),
             "match_key": key,
         })
 
-    order = {"TOP": 0, "HIGH": 1, "NORMAL": 2}
-
     signals.sort(
-        key=lambda item: (order.get(item["priority"], 9), item["teams"])
+        key=lambda item: item["teams"].lower()
     )
 
     return signals
@@ -1205,10 +1341,16 @@ def save_html_samples(cards):
 
     for index, card in enumerate(cards[:15]):
         html = card.get("html", "")
-        if html:
-            fragments.append(f"\n<!-- CARD {index + 1} -->\n{html}\n")
 
-    DEBUG_HTML.write_text("\n".join(fragments), encoding="utf-8")
+        if html:
+            fragments.append(
+                f"\n<!-- CARD {index + 1} -->\n{html}\n"
+            )
+
+    DEBUG_HTML.write_text(
+        "\n".join(fragments),
+        encoding="utf-8"
+    )
 
 
 # ============================================================
@@ -1220,11 +1362,17 @@ def scrape_page():
 
         browser = playwright.chromium.launch(
             headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ]
         )
 
         context = browser.new_context(
-            viewport={"width": 1440, "height": 1000},
+            viewport={
+                "width": 1440,
+                "height": 1000
+            },
             locale="en-US",
             timezone_id="UTC",
             user_agent=(
@@ -1250,10 +1398,13 @@ def scrape_page():
 
             try:
                 page.wait_for_selector(
-                    'a[href*="/football/h2h/"]', timeout=20000
+                    'a[href*="/football/h2h/"]',
+                    timeout=20000
                 )
             except Exception:
-                log.warning("Match links did not appear before timeout.")
+                log.warning(
+                    "Match links did not appear before timeout."
+                )
 
             extracted = page.evaluate(EXTRACT_CARDS_JS)
 
@@ -1262,9 +1413,15 @@ def scrape_page():
                 "page_title": page.title(),
                 "final_url": page.url,
                 "cards": extracted.get("cards", []),
-                "match_links_found": extracted.get("match_links_found", 0),
-                "unique_match_links": extracted.get("unique_match_links", 0),
-                "pagination_links": extracted.get("pagination_links", []),
+                "match_links_found": extracted.get(
+                    "match_links_found", 0
+                ),
+                "unique_match_links": extracted.get(
+                    "unique_match_links", 0
+                ),
+                "pagination_links": extracted.get(
+                    "pagination_links", []
+                ),
                 "body_text": clean_text(
                     page.locator("body").inner_text()
                 )[:3000],
@@ -1288,6 +1445,10 @@ def main():
 
     log.info("Starting OddsPortal parser")
     log.info("Source: %s", SOURCE_URL)
+    log.info(
+        "Allowed markets: %s",
+        sorted(ALLOWED_MARKET_CODES)
+    )
 
     result = scrape_page()
     cards = result["cards"]
@@ -1297,6 +1458,7 @@ def main():
     seen = set()
 
     for index, card in enumerate(cards):
+
         try:
             row, error = parse_card(card, scraped_at)
 
@@ -1307,11 +1469,13 @@ def main():
                     "anchor_text": clean_text(
                         card.get("anchorText", "")
                     )[:300],
-                    "card_text": clean_text(card.get("text", ""))[:700],
+                    "card_text": clean_text(
+                        card.get("text", "")
+                    )[:700],
                 })
+
                 continue
 
-            # Дедуплікація лише точних повторів одного й того ж рядка.
             duplicate_key = (
                 row["match_key"],
                 row["market_code"],
@@ -1330,6 +1494,7 @@ def main():
                     "reason": "exact_duplicate_row",
                     "anchor_text": row["teams"],
                 })
+
                 continue
 
             seen.add(duplicate_key)
@@ -1344,40 +1509,81 @@ def main():
                 )[:300],
             })
 
-    qualifying_rows = [r for r in rows if r.get("qualifies")]
+    # Усі валідні рядки дозволених ринків.
+    # Критерії застосовуються окремо для сигналів.
+    qualifying_rows = [
+        row for row in rows
+        if row.get("qualifies")
+    ]
 
-    signals = build_signals(qualifying_rows, scraped_at)
+    signals = build_signals(rows, scraped_at)
 
-    # Поточний знімок - усі валідні картки.
-    write_csv(LATEST_CSV, rows, CSV_FIELDS)
+    # Поточний CSV: тільки 1X2 і Total.
+    write_csv(
+        LATEST_CSV,
+        rows,
+        CSV_FIELDS
+    )
 
-    # Історія - усі валідні картки, включно з позитивною форою,
-    # періодами 1H/2H та рядками поза критеріями.
+    # Історія: нові записи тільки 1X2 і Total.
+    # Старі записи в SQLite не видаляються.
     new_history_rows = save_history(rows)
-    append_csv(HISTORY_CSV, new_history_rows, CSV_FIELDS)
 
-    # Сигнали - лише три цільові групи, лише FT.
-    write_csv(SIGNALS_CSV, signals, SIGNAL_FIELDS)
+    # У CSV додаємо лише нові записи з БД.
+    append_csv(
+        HISTORY_CSV,
+        new_history_rows,
+        CSV_FIELDS
+    )
+
+    # Сигнали: один NORMAL на матч, якщо пройшов хоча б один критерій.
+    write_csv(
+        SIGNALS_CSV,
+        signals,
+        SIGNAL_FIELDS
+    )
 
     group_counts = {}
     period_counts = {}
 
     for row in rows:
         group = row.get("market_group", "other")
-        group_counts[group] = group_counts.get(group, 0) + 1
+
+        group_counts[group] = (
+            group_counts.get(group, 0) + 1
+        )
 
         period = row.get("period", "FT")
-        period_counts[period] = period_counts.get(period, 0) + 1
+
+        period_counts[period] = (
+            period_counts.get(period, 0) + 1
+        )
 
     missing = {
-        "country": sum(not r.get("country") for r in rows),
-        "league": sum(not r.get("league") for r in rows),
-        "match_time": sum(not r.get("match_time") for r in rows),
-        "teams": sum(not r.get("teams") for r in rows),
-        "best_current_odds": sum(
-            r.get("best_current_odds") in (None, "") for r in rows
+        "country": sum(
+            not row.get("country")
+            for row in rows
         ),
-        "selection": sum(not r.get("selection") for r in rows),
+        "league": sum(
+            not row.get("league")
+            for row in rows
+        ),
+        "match_time": sum(
+            not row.get("match_time")
+            for row in rows
+        ),
+        "teams": sum(
+            not row.get("teams")
+            for row in rows
+        ),
+        "best_current_odds": sum(
+            row.get("best_current_odds") in (None, "")
+            for row in rows
+        ),
+        "selection": sum(
+            not row.get("selection")
+            for row in rows
+        ),
     }
 
     duration = round(time.time() - started, 2)
@@ -1395,9 +1601,15 @@ def main():
         "qualifying_rows": len(qualifying_rows),
         "signals": len(signals),
         "new_database_records": len(new_history_rows),
-        "history_policy": "all_valid_parsed_rows",
-        "positive_handicap_in_history": True,
-        "positive_handicap_in_signals": False,
+        "allowed_market_codes": sorted(ALLOWED_MARKET_CODES),
+        "history_policy": (
+            "new records only for 1X2 and Total; "
+            "existing records preserved"
+        ),
+        "signal_policy": (
+            "one NORMAL signal per match if at least "
+            "one qualifying 1X2 or Total row exists; FT only"
+        ),
         "signal_periods": sorted(SIGNAL_PERIODS),
         "missing": missing,
         "market_group_counts": group_counts,
@@ -1416,9 +1628,15 @@ def main():
 
     log.info(
         "Cards=%s Parsed=%s Qualifying=%s Signals=%s NewDB=%s",
-        len(cards), len(rows), len(qualifying_rows),
-        len(signals), len(new_history_rows)
+        len(cards),
+        len(rows),
+        len(qualifying_rows),
+        len(signals),
+        len(new_history_rows)
     )
+
+    log.info("Market groups=%s", group_counts)
+    log.info("Periods=%s", period_counts)
     log.info("Missing=%s failures=%s", missing, len(parse_failures))
     log.info("Finished in %s seconds", duration)
 
