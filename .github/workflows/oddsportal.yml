@@ -18,17 +18,15 @@ jobs:
   scrape:
     name: Scrape OddsPortal
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
-      # 1. Завантаження репозиторію
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      # 2. Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -36,21 +34,20 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      # 3. Встановлення залежностей
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      # 4. Запуск парсера
       - name: Run OddsPortal parser
         env:
           PYTHONUNBUFFERED: "1"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
         run: |
           python scrape_oddsportal.py
 
-      # 5. Перевірка результатів
       - name: Check generated data
         run: |
           echo "Files in data/:"
@@ -59,7 +56,6 @@ jobs:
           test -f data/oddsportal_latest.csv
           test -f data/oddsportal_debug.json
 
-      # 6. Збереження результатів у GitHub
       - name: Commit and push data
         run: |
           git config user.name "github-actions[bot]"
@@ -73,14 +69,10 @@ jobs:
             git commit -m "Update OddsPortal data"
           fi
 
-          # Оновлюємо локальну гілку перед відправленням
           git fetch origin main
           git rebase origin/main
-
-          # Відправляємо без примусового перезапису
           git push origin HEAD:main
 
-      # 7. Підсумок
       - name: Workflow summary
         if: always()
         run: |
