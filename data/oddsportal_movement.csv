@@ -1,4 +1,10 @@
-﻿calculated_at_utc,match_key,teams,market_code,period,selection,reference_odds,current_odds,change_15m_pct,change_30m_pct,change_60m_pct,snapshot_15m_utc,snapshot_30m_utc,snapshot_60m_utc
-2026-11-10T18:36:52+00:00,https://www.oddsportal.com/football/h2h/grimsby-oeais3za/nottingham-bmfcwchm,Grimsby - Nottingham U21,1x2,FT,2,6.4,2.0,,,,,,
-2026-11-10T18:36:52+00:00,https://www.oddsportal.com/football/h2h/grimsby-oeais3za/nottingham-bmfcwchm,Grimsby - Nottingham U21,1x2,2H,2,5.07,2.05,,,,,,
-2026-11-10T18:36:52+00:00,https://www.oddsportal.com/football/h2h/colchester-xyu73rnn/ipswich-kuhl7ysb,Colchester - Ipswich U21,1x2,FT,2,4.82,3.35,,48.89,,,2026-11-10T18:06:45+00:00,
+﻿calculated_at_utc,match_key,teams,market_code,period,selection,handicap_line,current_odds,change_15m_pct,change_30m_pct,change_60m_pct
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/atl-nacional-c23omttl/once-caldas-bvsndlmd,Once Caldas - Atl. Nacional,over-under,1H,Over,3.50,16.5,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/chambery-2m7cxvnq/grenoble-ugpj1p1n,Chambery - Grenoble,1x2,FT,1,,12.81,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/bayern-munich-vkjy3nf9/psg-8u7zunf2,PSG W - Bayern Munich W,over-under,FT,Over,7.50,16.0,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/atl-nacional-c23omttl/once-caldas-bvsndlmd,Once Caldas - Atl. Nacional,over-under,FT,Over,6.50,26.33,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/tavernes-edlniiel/valencia-cqeaytrd,Tavernes - Valencia,over-under,1H,Over,5.50,6.83,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/tigres-uanl-u1ymurr3/unam-pumas-xmyrebad,UNAM Pumas W - Tigres UANL W,over-under,1H,Over,4.50,23.5,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/chambery-2m7cxvnq/grenoble-ugpj1p1n,Chambery - Grenoble,1x2,1H,1,,9.5,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/juventud-uclol6tq/liverpool-m-0kukbkxt,Liverpool M. - Juventud,over-under,1H,Over,3.50,20.5,,,
+2026-11-10T19:46:13+00:00,https://www.oddsportal.com/football/h2h/chambery-2m7cxvnq/grenoble-ugpj1p1n,Chambery - Grenoble,1x2,2H,1,,9.23,,,
