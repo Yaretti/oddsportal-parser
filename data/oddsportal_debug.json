@@ -1,5 +1,5 @@
 {
-  "started_at": "2026-11-10T15:54:33.243061+00:00",
+  "started_at": "2026-11-10T16:01:28.076820+00:00",
   "source_url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
   "http_status": 200,
   "final_url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
@@ -23,9 +23,9 @@
   },
   "errors": [],
   "parse_failure_samples": [],
-  "finished_at": "2026-11-10T15:54:43.553234+00:00",
-  "duration_seconds": 10.31,
-  "history_new_rows": 19,
+  "finished_at": "2026-11-10T16:01:37.714434+00:00",
+  "duration_seconds": 9.64,
+  "history_new_rows": 3,
   "database_new_records": 19,
   "signal_priorities": {
     "TOP": 0,
