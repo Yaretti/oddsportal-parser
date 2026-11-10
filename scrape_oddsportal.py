@@ -5,46 +5,50 @@
 """
 GREENLINE / OddsPortal Dropping Odds Parser
 
-РИНКИ:
+MARKETS:
 - 1X2
 - Over/Under (Total)
 
-КРИТЕРІЇ:
-1) Початковий коефіцієнт 4.00–6.00 включно -> новий <= 2.50.
-2) Початковий коефіцієнт 2.00–3.00 включно -> новий <= 1.80.
+CRITERIA:
+1) Old odds 4.00-6.00 inclusive -> new odds <= 2.50.
+2) Old odds 2.00-3.00 inclusive -> new odds <= 1.80.
 
-СИГНАЛИ:
-- достатньо одного критерію;
-- один NORMAL-сигнал на матч;
-- тільки FT;
-- 1X2 і Total не створюють два сигнали на один матч.
+SIGNALS:
+- One qualifying market is sufficient.
+- One NORMAL signal per match.
+- FT only.
+- 1X2 and Total are combined into one Telegram message.
 
-МОНІТОРИНГ:
-- запускається workflow кожні 15 хвилин;
-- зберігає часові знімки коефіцієнтів;
-- горизонт матчів: 7 днів;
-- розраховує зміну за 15, 30 і 60 хвилин;
-- T-30: найближчий знімок у межах +/-15 хвилин від цільового часу;
-- якщо знімка немає — UNAVAILABLE.
+MONITORING:
+- Workflow scheduled every 15 minutes.
+- Next 7 days, based on matches discovered on Dropping Odds.
+- Historical snapshots.
+- Movement calculations for 15, 30 and 60 minutes.
+- T-30: nearest snapshot within +/-15 minutes of kickoff - 30 minutes.
+- Missing snapshot = UNAVAILABLE.
 
-ЧАС:
-- внутрішнє зберігання UTC;
-- відображення Europe/Kyiv.
+TIME:
+- Stored in UTC.
+- Displayed in Europe/Kyiv.
 
-ВАЖЛИВО:
-- T-30 використовує тільки знімки, отримані з Dropping Odds.
-- Це не незалежне оновлення коефіцієнтів зі сторінки матчу.
-- Наявність матчів на 7 днів залежить від того, що показує джерело.
+TELEGRAM:
+- One message per match.
+- Persistent outbox in SQLite.
+- Failed messages remain PENDING for retry.
+- Successful messages are marked SENT.
 """
 
 import csv
 import hashlib
+import html
 import json
 import logging
 import os
 import re
 import sqlite3
 import time
+import urllib.request
+import urllib.error
 
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -74,8 +78,10 @@ HORIZON_DAYS = 7
 SNAPSHOT_INTERVAL_MINUTES = 15
 T30_TARGET_MINUTES = 30
 T30_TOLERANCE_MINUTES = 15
-
 DROP_TOLERANCE_PP = 2.0
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 UTC = timezone.utc
 KYIV = ZoneInfo("Europe/Kyiv")
@@ -124,33 +130,13 @@ log = logging.getLogger("oddsportal")
 # ============================================================
 
 CSV_FIELDS = [
-    "scraped_at",
-    "sport",
-    "country",
-    "country_slug",
-    "league",
-    "teams",
-    "match_date",
-    "match_time",
-    "match_datetime",
-    "market",
-    "market_code",
-    "market_group",
-    "period",
-    "selection",
-    "selection_code",
-    "flow_to_team",
-    "flow_direction",
-    "flow_confidence",
-    "handicap_line",
-    "drop_pct",
-    "calculated_drop_pct",
-    "odds_old",
-    "odds_new",
-    "best_current_odds",
-    "qualifies",
-    "match_url",
-    "match_key",
+    "scraped_at", "sport", "country", "country_slug", "league",
+    "teams", "match_date", "match_time", "match_datetime",
+    "market", "market_code", "market_group", "period",
+    "selection", "selection_code", "flow_to_team",
+    "flow_direction", "flow_confidence", "handicap_line",
+    "drop_pct", "calculated_drop_pct", "odds_old", "odds_new",
+    "best_current_odds", "qualifies", "match_url", "match_key",
 ]
 
 SIGNAL_FIELDS = [
@@ -397,7 +383,11 @@ def parse_best_odds_from_text(text):
 # ============================================================
 
 def detect_market_label(text, fallback):
-    for pattern in (r"O/U\s*\d+(?:[.,]\d+)?", r"Over\s*/\s*Under", r"1X2"):
+    for pattern in (
+        r"O/U\s*\d+(?:[.,]\d+)?",
+        r"Over\s*/\s*Under",
+        r"1X2"
+    ):
         found = re.search(pattern, text or "", re.IGNORECASE)
         if found:
             return clean_text(found.group(0))
@@ -410,9 +400,6 @@ def detect_period(label, scope_code):
         return "1H"
     if "2nd half" in low:
         return "2H"
-
-    # Коди scope 3/4 у вихідному парсері не були підтверджені.
-    # Залишаємо попередню логіку сумісності.
     return {"3": "1H", "4": "2H"}.get(str(scope_code), "FT")
 
 
@@ -429,6 +416,7 @@ def normalize_selection(value):
 
 def detect_flow_direction(selection, market_group, home, away):
     selection = normalize_selection(selection)
+
     result = {
         "flow_to_team": "Невизначено",
         "flow_direction": "Невизначено",
@@ -556,7 +544,6 @@ def parse_match_time_and_teams(anchor_text, card_text=""):
     anchor_text = str(anchor_text or "")
     card_text = str(card_text or "")
 
-    # Спочатку шукаємо повну дату, потім відносну, і лише потім час.
     match_time = ""
     for pattern in TIME_PATTERNS:
         for source in (anchor_text, card_text):
@@ -591,7 +578,10 @@ def parse_match_time_and_teams(anchor_text, card_text=""):
             line, maxsplit=1, flags=re.IGNORECASE
         )
         if len(parts) == 2 and all(clean_text(x) for x in parts):
-            return f"{clean_text(parts[0])} - {clean_text(parts[1])}", match_time
+            return (
+                f"{clean_text(parts[0])} - {clean_text(parts[1])}",
+                match_time
+            )
 
     if len(cleaned) >= 2:
         return f"{cleaned[-2]} - {cleaned[-1]}", match_time
@@ -605,15 +595,6 @@ def parse_match_time_and_teams(anchor_text, card_text=""):
 # ============================================================
 
 def parse_match_datetime(match_time, scraped_at):
-    """
-    Час на OddsPortal у цьому парсері трактується як UTC.
-    Далі UTC конвертується у Europe/Kyiv з урахуванням DST.
-
-    Це відповідає перевіреному користувачем прикладу:
-    19:45 на джерелі -> 21:45 у Києві 10.11.2026.
-    Якщо OddsPortal змінить часову зону відображення,
-    потрібно буде змінити SOURCE_TIMEZONE.
-    """
     if not match_time:
         return "", "", ""
 
@@ -689,7 +670,7 @@ def parse_match_datetime(match_time, scraped_at):
             f"{date_value.isoformat()} {clock}",
             "%Y-%m-%d %H:%M"
         )
-        # Джерельний час — UTC; не додаємо фіксовані +2 години.
+        # Поточне припущення: час OddsPortal = UTC.
         match_utc = naive.replace(tzinfo=UTC)
         match_kyiv = match_utc.astimezone(KYIV)
 
@@ -794,8 +775,6 @@ EXTRACT_CARDS_JS = r"""
       continue;
     }
 
-    // Не використовуємо Set по всьому контейнеру:
-    // різні ринки/вибори можуть мати спільного предка.
     const uniqueCardKey = href + "|" + movementLi.outerHTML;
     if (seenCards.has(uniqueCardKey)) continue;
     seenCards.add(uniqueCardKey);
@@ -1196,6 +1175,18 @@ def initialize_database(conn):
         )
     """)
 
+    # Telegram outbox: один запис на матч.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_outbox (
+            match_key TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            last_error TEXT
+        )
+    """)
+
     conn.commit()
 
 
@@ -1295,7 +1286,6 @@ def save_snapshots(conn, rows, now_utc):
     now_text = iso_utc(now_utc)
 
     for row in rows:
-        # Зберігаємо знімки тільки дозволених ринків.
         if row.get("market_code") not in ALLOWED_MARKET_CODES:
             continue
 
@@ -1331,7 +1321,6 @@ def save_snapshots(conn, rows, now_utc):
 # ============================================================
 
 def nearest_snapshot(conn, series_key, target_utc, tolerance_minutes=8):
-    target_text = iso_utc(target_utc)
     rows = conn.execute("""
         SELECT observed_at_utc, best_current_odds, odds_new
         FROM odds_snapshots
@@ -1345,10 +1334,14 @@ def nearest_snapshot(conn, series_key, target_utc, tolerance_minutes=8):
     )).fetchall()
 
     candidates = []
+
     for observed, best, new in rows:
         dt = parse_iso(observed)
         if dt:
-            candidates.append((abs((dt - target_utc).total_seconds()), dt, best or new))
+            odds = best if best is not None else new
+            candidates.append((
+                abs((dt - target_utc).total_seconds()), dt, odds
+            ))
 
     if not candidates:
         return None
@@ -1363,17 +1356,22 @@ def calculate_movement(conn, rows, now_utc):
 
     for row in rows:
         series_key = make_series_key(row)
-        current = row.get("best_current_odds") or row.get("odds_new")
+        current = (
+            row.get("best_current_odds")
+            if row.get("best_current_odds") is not None
+            else row.get("odds_new")
+        )
+
         if current is None:
             continue
 
         values = {}
+
         for minutes in (15, 30, 60):
             target = now_utc - timedelta(minutes=minutes)
-            found = nearest_snapshot(
+            values[minutes] = nearest_snapshot(
                 conn, series_key, target, tolerance_minutes=8
             )
-            values[minutes] = found
 
         def pct(old, new):
             if old is None or new is None or old <= 0:
@@ -1409,25 +1407,18 @@ def calculate_movement(conn, rows, now_utc):
 # ============================================================
 
 def process_t30_checkpoints(conn, now_utc):
-    """
-    T-30 завершується після закриття вікна допуску:
-    ціль T-30 +/- 15 хвилин.
-    Тобто фіналізуємо після kickoff - 15 хвилин.
-
-    Для кожного tracked match зберігаємо окремий результат
-    по кожній серії ринку/вибору.
-    """
     finalized = []
 
     tracked = conn.execute("""
-        SELECT match_key, teams, country, league, match_url, kickoff_utc, t30_status
+        SELECT match_key, teams, country, league, match_url, kickoff_utc
         FROM tracked_matches
         WHERE t30_status='PENDING'
     """).fetchall()
 
     for item in tracked:
-        match_key, teams, country, league, match_url, kickoff_text, _ = item
+        match_key, teams, country, league, match_url, kickoff_text = item
         kickoff = parse_iso(kickoff_text)
+
         if not kickoff:
             continue
 
@@ -1444,7 +1435,6 @@ def process_t30_checkpoints(conn, now_utc):
         """, (match_key,)).fetchall()
 
         if not series_rows:
-            # Немає жодного знімка для цього матчу.
             conn.execute("""
                 INSERT OR IGNORE INTO final_odds_t30 (
                     match_key, series_key, teams, country, league,
@@ -1454,16 +1444,6 @@ def process_t30_checkpoints(conn, now_utc):
                 match_key, "NO_SNAPSHOT", teams, country, league,
                 iso_utc(kickoff), iso_utc(target)
             ))
-            conn.execute(
-                "UPDATE tracked_matches SET t30_status='FINALIZED' WHERE match_key=?",
-                (match_key,)
-            )
-            finalized.append({
-                "match_key": match_key,
-                "teams": teams,
-                "checkpoint_status": "UNAVAILABLE",
-            })
-            continue
 
         for (series_key,) in series_rows:
             candidates = conn.execute("""
@@ -1498,20 +1478,25 @@ def process_t30_checkpoints(conn, now_utc):
                 return abs((dt - target).total_seconds()) if dt else float("inf")
 
             chosen = min(candidates, key=distance)
+
             (
                 snapshot_text, market_code, market_group, period,
                 selection, odds_old, best_current, odds_new, snapshot_url
             ) = chosen
 
             snapshot_dt = parse_iso(snapshot_text)
-            checkpoint_odds = best_current if best_current is not None else odds_new
+            checkpoint_odds = (
+                best_current if best_current is not None else odds_new
+            )
 
             if checkpoint_odds is None:
                 status = "UNAVAILABLE"
                 qualifies = None
             else:
                 status = "AVAILABLE"
-                qualifies = int(qualifies_odds(odds_old, checkpoint_odds))
+                qualifies = int(
+                    qualifies_odds(odds_old, checkpoint_odds)
+                )
 
             actual_minutes = (
                 round((kickoff - snapshot_dt).total_seconds() / 60)
@@ -1538,10 +1523,12 @@ def process_t30_checkpoints(conn, now_utc):
                 qualifies, snapshot_url
             ))
 
-        conn.execute(
-            "UPDATE tracked_matches SET t30_status='FINALIZED' WHERE match_key=?",
-            (match_key,)
-        )
+        conn.execute("""
+            UPDATE tracked_matches
+            SET t30_status='FINALIZED'
+            WHERE match_key=?
+        """, (match_key,))
+
         finalized.append({
             "match_key": match_key,
             "teams": teams,
@@ -1564,6 +1551,7 @@ def export_t30_csv(conn):
     """).fetchall()
 
     output = []
+
     for r in rows:
         (
             match_key, teams, country, league, kickoff, target, snapshot,
@@ -1571,21 +1559,17 @@ def export_t30_csv(conn):
             old, checkpoint, qualifies, url
         ) = r
 
-        kickoff_dt = parse_iso(kickoff)
-        target_dt = parse_iso(target)
-        snapshot_dt = parse_iso(snapshot)
-
         output.append({
             "match_key": match_key,
             "teams": teams,
             "country": country,
             "league": league,
             "kickoff_utc": kickoff or "",
-            "kickoff_kyiv": iso_kyiv(kickoff_dt),
+            "kickoff_kyiv": iso_kyiv(parse_iso(kickoff)),
             "target_t30_utc": target or "",
-            "target_t30_kyiv": iso_kyiv(target_dt),
+            "target_t30_kyiv": iso_kyiv(parse_iso(target)),
             "snapshot_utc": snapshot or "",
-            "snapshot_kyiv": iso_kyiv(snapshot_dt),
+            "snapshot_kyiv": iso_kyiv(parse_iso(snapshot)),
             "actual_checkpoint": actual or "",
             "checkpoint_status": status or "",
             "market_code": market_code or "",
@@ -1622,7 +1606,9 @@ def build_signals(rows, scraped_at):
         if not key:
             continue
 
-        item = grouped.setdefault(key, {"rows": [], "groups": set()})
+        item = grouped.setdefault(
+            key, {"rows": [], "groups": set()}
+        )
         item["rows"].append(row)
         item["groups"].add(row["market_group"])
 
@@ -1634,14 +1620,17 @@ def build_signals(rows, scraped_at):
         groups = item["groups"]
 
         market_lines = []
+
         for row in match_rows:
+            drop_value = abs(float(row.get("drop_pct") or 0))
+
             market_lines.append(
-                "{} [{}] {} -> {} | Вибір: {}".format(
+                "{} | Вибір: {} | Старий: {:.2f} | Новий: {:.2f} | Падіння: {:.2f}%".format(
                     row.get("market", ""),
                     row.get("selection", ""),
-                    row.get("odds_old", ""),
-                    row.get("odds_new", ""),
-                    row.get("flow_to_team", "Невизначено"),
+                    float(row.get("odds_old") or 0),
+                    float(row.get("odds_new") or 0),
+                    drop_value,
                 )
             )
 
@@ -1667,6 +1656,210 @@ def build_signals(rows, scraped_at):
 
 
 # ============================================================
+# TELEGRAM
+# ============================================================
+
+def build_telegram_message(signal):
+    teams = html.escape(signal.get("teams") or "Unknown match")
+    country = html.escape(signal.get("country") or "")
+    league = html.escape(signal.get("league") or "")
+
+    lines = [
+        "🚨 <b>GREENLINE — ODDS SIGNAL</b>",
+        "",
+        "🟢 <b>NORMAL</b>",
+        f"⚽ <b>{teams}</b>",
+    ]
+
+    competition = " | ".join(
+        value for value in (country, league) if value
+    )
+    if competition:
+        lines.append(f"🏆 {competition}")
+
+    if signal.get("match_date"):
+        lines.append(
+            f"📅 {html.escape(signal['match_date'])}"
+        )
+
+    if signal.get("match_time"):
+        lines.append(
+            f"🕘 {html.escape(signal['match_time'])} Kyiv"
+        )
+
+    lines.append("")
+    lines.append("📉 <b>Падіння коефіцієнтів:</b>")
+
+    for item in signal.get("markets", "").split(" || "):
+        if item.strip():
+            lines.append(html.escape(item.strip()))
+
+    match_url = signal.get("match_url", "")
+    if match_url:
+        safe_url = html.escape(match_url, quote=True)
+        lines.extend([
+            "",
+            f'🔗 <a href="{safe_url}">Відкрити матч</a>',
+        ])
+
+    message = "\n".join(lines)
+
+    if len(message) > 4000:
+        message = message[:3950] + "\n…"
+
+    return message
+
+
+def telegram_api_send(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID не налаштовано"
+        )
+
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
+
+        if not result.get("ok"):
+            raise RuntimeError(
+                result.get("description", "Telegram API error")
+            )
+
+        return True
+
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode(
+            "utf-8", errors="replace"
+        )
+
+        try:
+            error_data = json.loads(error_body)
+            description = error_data.get(
+                "description", f"HTTP {exc.code}"
+            )
+        except Exception:
+            description = f"HTTP {exc.code}"
+
+        raise RuntimeError(description) from None
+
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Telegram connection error: {exc.reason}"
+        ) from None
+
+
+def process_telegram_outbox(conn, signals):
+    """
+    Queue new qualifying signals.
+    Retry pending messages.
+    Mark SENT only after Telegram confirms success.
+
+    One match_key = one notification record.
+    """
+
+    now_text = utc_now()
+
+    for signal in signals:
+        match_key = signal.get("match_key")
+        if not match_key:
+            continue
+
+        message = build_telegram_message(signal)
+
+        conn.execute("""
+            INSERT OR IGNORE INTO telegram_outbox (
+                match_key, payload, created_at, status
+            )
+            VALUES (?, ?, ?, 'PENDING')
+        """, (match_key, message, now_text))
+
+    conn.commit()
+
+    pending = conn.execute("""
+        SELECT match_key, payload
+        FROM telegram_outbox
+        WHERE status='PENDING'
+        ORDER BY created_at ASC
+    """).fetchall()
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning(
+            "Telegram credentials missing. Pending=%s",
+            len(pending)
+        )
+        return {
+            "pending": len(pending),
+            "sent": 0,
+            "failed": 0,
+            "configured": False,
+        }
+
+    sent = 0
+    failed = 0
+
+    for match_key, message in pending:
+        try:
+            telegram_api_send(message)
+
+            conn.execute("""
+                UPDATE telegram_outbox
+                SET status='SENT',
+                    sent_at=?,
+                    last_error=NULL
+                WHERE match_key=?
+            """, (utc_now(), match_key))
+
+            conn.commit()
+            sent += 1
+
+            log.info("Telegram signal sent: %s", match_key)
+
+        except Exception as exc:
+            conn.execute("""
+                UPDATE telegram_outbox
+                SET last_error=?
+                WHERE match_key=?
+            """, (str(exc)[:1000], match_key))
+
+            conn.commit()
+            failed += 1
+
+            log.error(
+                "Telegram send failed for %s: %s",
+                match_key, exc
+            )
+
+    return {
+        "pending": len(pending),
+        "sent": sent,
+        "failed": failed,
+        "configured": True,
+    }
+
+
+# ============================================================
 # DEBUG
 # ============================================================
 
@@ -1679,11 +1872,18 @@ def save_debug(data):
 
 def save_html_samples(cards):
     fragments = []
+
     for index, card in enumerate(cards[:15]):
-        html = card.get("html", "")
-        if html:
-            fragments.append(f"\n<!-- CARD {index + 1} -->\n{html}\n")
-    DEBUG_HTML.write_text("\n".join(fragments), encoding="utf-8")
+        html_fragment = card.get("html", "")
+        if html_fragment:
+            fragments.append(
+                f"\n<!-- CARD {index + 1} -->\n{html_fragment}\n"
+            )
+
+    DEBUG_HTML.write_text(
+        "\n".join(fragments),
+        encoding="utf-8"
+    )
 
 
 # ============================================================
@@ -1717,6 +1917,7 @@ def scrape_page():
                 wait_until="domcontentloaded",
                 timeout=TIMEOUT_MS
             )
+
             http_status = response.status if response else None
 
             page.wait_for_timeout(6000)
@@ -1727,7 +1928,9 @@ def scrape_page():
                     timeout=20000
                 )
             except Exception:
-                log.warning("Match links did not appear before timeout.")
+                log.warning(
+                    "Match links did not appear before timeout."
+                )
 
             extracted = page.evaluate(EXTRACT_CARDS_JS)
 
@@ -1736,16 +1939,71 @@ def scrape_page():
                 "page_title": page.title(),
                 "final_url": page.url,
                 "cards": extracted.get("cards", []),
-                "match_links_found": extracted.get("match_links_found", 0),
-                "unique_match_links": extracted.get("unique_match_links", 0),
-                "pagination_links": extracted.get("pagination_links", []),
+                "match_links_found": extracted.get(
+                    "match_links_found", 0
+                ),
+                "unique_match_links": extracted.get(
+                    "unique_match_links", 0
+                ),
+                "pagination_links": extracted.get(
+                    "pagination_links", []
+                ),
                 "body_text": clean_text(
                     page.locator("body").inner_text()
                 )[:3000],
             }
+
         finally:
             context.close()
             browser.close()
+
+
+# ============================================================
+# EXPORT SNAPSHOTS
+# ============================================================
+
+def export_snapshots_csv(conn):
+    snapshot_db_rows = conn.execute("""
+        SELECT observed_at_utc, match_key, teams, country, league,
+               match_datetime_utc, market_code, market_group, period,
+               selection, handicap_line, odds_old, odds_new,
+               best_current_odds, drop_pct, qualifies, match_url
+        FROM odds_snapshots
+        ORDER BY observed_at_utc DESC
+    """).fetchall()
+
+    output = []
+
+    for r in snapshot_db_rows:
+        (
+            observed, match_key, teams, country, league, kickoff,
+            market_code, market_group, period, selection, line,
+            old, new, best, drop, qualifies, url
+        ) = r
+
+        output.append({
+            "observed_at_utc": observed or "",
+            "observed_at_kyiv": iso_kyiv(parse_iso(observed)),
+            "match_key": match_key or "",
+            "teams": teams or "",
+            "country": country or "",
+            "league": league or "",
+            "match_datetime_utc": kickoff or "",
+            "match_datetime_kyiv": iso_kyiv(parse_iso(kickoff)),
+            "market_code": market_code or "",
+            "market_group": market_group or "",
+            "period": period or "",
+            "selection": selection or "",
+            "handicap_line": line or "",
+            "odds_old": old,
+            "odds_new": new,
+            "best_current_odds": best,
+            "drop_pct": drop,
+            "qualifies": qualifies,
+            "match_url": url or "",
+        })
+
+    write_csv(SNAPSHOTS_CSV, output, SNAPSHOT_FIELDS)
 
 
 # ============================================================
@@ -1763,7 +2021,8 @@ def main():
     log.info("Starting OddsPortal parser")
     log.info("Source: %s", SOURCE_URL)
     log.info("Horizon: next %s days", HORIZON_DAYS)
-    log.info("Snapshot interval expected: %s minutes", SNAPSHOT_INTERVAL_MINUTES)
+    log.info("Snapshot interval expected: %s minutes",
+             SNAPSHOT_INTERVAL_MINUTES)
     log.info("Timezone output: Europe/Kyiv")
     log.info("Allowed markets: %s", sorted(ALLOWED_MARKET_CODES))
     log.info("Criterion 1: 4.00-6.00 -> <= 2.50")
@@ -1771,6 +2030,7 @@ def main():
 
     result = scrape_page()
     cards = result["cards"]
+
     save_html_samples(cards)
 
     seen = set()
@@ -1783,14 +2043,15 @@ def main():
                 parse_failures.append({
                     "card": index + 1,
                     "reason": error,
-                    "anchor_text": clean_text(card.get("anchorText", ""))[:300],
-                    "card_text": clean_text(card.get("text", ""))[:700],
+                    "anchor_text": clean_text(
+                        card.get("anchorText", "")
+                    )[:300],
+                    "card_text": clean_text(
+                        card.get("text", "")
+                    )[:700],
                 })
                 continue
 
-            # Поточний список може містити матчі поза горизонтом.
-            # У latest залишаємо всі розпарсені рядки, а історію знімків
-            # і tracked_matches обмежуємо наступними 7 днями.
             duplicate_key = (
                 row["match_key"], row["market_code"], row["market"],
                 row["market_group"], row["period"], row["selection"],
@@ -1812,94 +2073,68 @@ def main():
             parse_failures.append({
                 "card": index + 1,
                 "reason": repr(exc),
-                "anchor_text": clean_text(card.get("anchorText", ""))[:300],
+                "anchor_text": clean_text(
+                    card.get("anchorText", "")
+                )[:300],
             })
 
-    # Для часової історії — тільки матчі з відомим часом у межах 7 днів.
     horizon_rows = []
+
     for row in rows:
         kickoff = parse_iso(row.get("match_datetime"))
         if kickoff and in_horizon(iso_utc(kickoff), now_dt):
             horizon_rows.append(row)
 
-    qualifying_rows = [r for r in rows if r.get("qualifies")]
+    qualifying_rows = [
+        row for row in rows if row.get("qualifies")
+    ]
+
     signals = build_signals(rows, scraped_at)
 
-    # Основний CSV поточного запуску.
     write_csv(LATEST_CSV, rows, CSV_FIELDS)
+    write_csv(SIGNALS_CSV, signals, SIGNAL_FIELDS)
 
     conn = sqlite3.connect(DATABASE_FILE)
+
     try:
         initialize_database(conn)
 
-        # Стара історія не видаляється.
+        # Preserve old history.
         new_history_rows = save_history(conn, rows)
         append_csv(HISTORY_CSV, new_history_rows, CSV_FIELDS)
 
-        # Зберігаємо знайдені матчі та кожне спостереження.
+        # Store discovered matches and snapshots.
         save_tracked_matches(conn, horizon_rows, now_dt)
         save_snapshots(conn, horizon_rows, now_dt)
 
-        # Розрахунок руху коефіцієнтів.
         movement_rows = calculate_movement(
             conn, horizon_rows, now_dt
         )
         write_csv(MOVEMENT_CSV, movement_rows, MOVEMENT_FIELDS)
 
-        # Фіналізація T-30 для матчів, у яких закрилося вікно +/-15 хв.
         t30_processed = process_t30_checkpoints(conn, now_dt)
         export_t30_csv(conn)
+        export_snapshots_csv(conn)
 
-        # Експорт усіх знімків у CSV.
-        snapshot_db_rows = conn.execute("""
-            SELECT observed_at_utc, match_key, teams, country, league,
-                   match_datetime_utc, market_code, market_group, period,
-                   selection, handicap_line, odds_old, odds_new,
-                   best_current_odds, drop_pct, qualifies, match_url
-            FROM odds_snapshots
-            ORDER BY observed_at_utc DESC
-        """).fetchall()
+        # Telegram queue and delivery.
+        telegram_result = process_telegram_outbox(
+            conn, signals
+        )
 
-        snapshot_export = []
-        for r in snapshot_db_rows:
-            (
-                observed, match_key, teams, country, league, kickoff,
-                market_code, market_group, period, selection, line,
-                old, new, best, drop, qualifies, url
-            ) = r
+        telegram_pending_total = conn.execute("""
+            SELECT COUNT(*)
+            FROM telegram_outbox
+            WHERE status='PENDING'
+        """).fetchone()[0]
 
-            observed_dt = parse_iso(observed)
-            kickoff_dt = parse_iso(kickoff)
-
-            snapshot_export.append({
-                "observed_at_utc": observed or "",
-                "observed_at_kyiv": iso_kyiv(observed_dt),
-                "match_key": match_key or "",
-                "teams": teams or "",
-                "country": country or "",
-                "league": league or "",
-                "match_datetime_utc": kickoff or "",
-                "match_datetime_kyiv": iso_kyiv(kickoff_dt),
-                "market_code": market_code or "",
-                "market_group": market_group or "",
-                "period": period or "",
-                "selection": selection or "",
-                "handicap_line": line or "",
-                "odds_old": old,
-                "odds_new": new,
-                "best_current_odds": best,
-                "drop_pct": drop,
-                "qualifies": qualifies,
-                "match_url": url or "",
-            })
-
-        write_csv(SNAPSHOTS_CSV, snapshot_export, SNAPSHOT_FIELDS)
+        telegram_sent_total = conn.execute("""
+            SELECT COUNT(*)
+            FROM telegram_outbox
+            WHERE status='SENT'
+        """).fetchone()[0]
 
     finally:
         conn.close()
-
-    # Поточні сигнали — один NORMAL на матч.
-    write_csv(SIGNALS_CSV, signals, SIGNAL_FIELDS)
 
     group_counts = {}
     period_counts = {}
@@ -1907,6 +2142,7 @@ def main():
     for row in rows:
         group = row.get("market_group", "other")
         period = row.get("period", "FT")
+
         group_counts[group] = group_counts.get(group, 0) + 1
         period_counts[period] = period_counts.get(period, 0) + 1
 
@@ -1918,7 +2154,8 @@ def main():
         "match_datetime": sum(not r.get("match_datetime") for r in rows),
         "teams": sum(not r.get("teams") for r in rows),
         "best_current_odds": sum(
-            r.get("best_current_odds") in (None, "") for r in rows
+            r.get("best_current_odds") in (None, "")
+            for r in rows
         ),
         "selection": sum(not r.get("selection") for r in rows),
     }
@@ -1941,36 +2178,54 @@ def main():
         "signals": len(signals),
         "new_database_records": len(new_history_rows),
         "t30_processed": t30_processed,
+        "telegram": telegram_result,
+        "telegram_pending_total": telegram_pending_total,
+        "telegram_sent_total": telegram_sent_total,
         "horizon_days": HORIZON_DAYS,
         "snapshot_interval_minutes": SNAPSHOT_INTERVAL_MINUTES,
         "t30_target_minutes": T30_TARGET_MINUTES,
         "t30_tolerance_minutes": T30_TOLERANCE_MINUTES,
         "timezone": "Europe/Kyiv",
-        "source_time_assumption": "OddsPortal displayed match time treated as UTC",
+        "source_time_assumption": (
+            "OddsPortal displayed match time treated as UTC; "
+            "must be independently verified"
+        ),
         "criteria": {
             "criterion_1": {
-                "old_min": 4.00, "old_max": 6.00, "new_max": 2.50
+                "old_min": 4.00,
+                "old_max": 6.00,
+                "new_max": 2.50
             },
             "criterion_2": {
-                "old_min": 2.00, "old_max": 3.00, "new_max": 1.80
+                "old_min": 2.00,
+                "old_max": 3.00,
+                "new_max": 1.80
             },
         },
         "allowed_market_codes": sorted(ALLOWED_MARKET_CODES),
         "history_policy": (
-            "old odds_history rows preserved; new records only 1X2 and Total"
+            "Old odds_history rows preserved; new records only "
+            "1X2 and Total"
         ),
         "snapshot_policy": (
-            "every run stores an observation for discovered matches in 7-day horizon"
+            "Snapshots are stored for discovered matches with "
+            "known kickoff inside the 7-day horizon"
         ),
         "t30_policy": (
-            "nearest stored snapshot within +/-15 minutes of kickoff minus 30 minutes; "
-            "otherwise UNAVAILABLE"
+            "Nearest stored snapshot within +/-15 minutes of "
+            "kickoff minus 30 minutes; otherwise UNAVAILABLE"
         ),
         "t30_limitation": (
-            "snapshots are sourced from Dropping Odds only; no independent match-page refresh"
+            "Snapshots are sourced from Dropping Odds only; "
+            "no independent match-page refresh"
         ),
         "signal_policy": (
-            "one NORMAL signal per match if at least one qualifying 1X2 or Total FT row exists"
+            "One NORMAL signal per match if at least one "
+            "qualifying 1X2 or Total FT row exists"
+        ),
+        "telegram_policy": (
+            "Persistent outbox; one notification record per match_key; "
+            "pending messages retried on subsequent runs"
         ),
         "signal_periods": sorted(SIGNAL_PERIODS),
         "missing": missing,
@@ -1989,14 +2244,18 @@ def main():
     save_debug(debug)
 
     log.info(
-        "Cards=%s Parsed=%s Horizon=%s Qualifying=%s Signals=%s NewDB=%s",
+        "Cards=%s Parsed=%s Horizon=%s Qualifying=%s "
+        "Signals=%s NewDB=%s",
         len(cards), len(rows), len(horizon_rows),
-        len(qualifying_rows), len(signals), len(new_history_rows)
+        len(qualifying_rows), len(signals),
+        len(new_history_rows)
     )
+
     log.info("Market groups=%s", group_counts)
     log.info("Periods=%s", period_counts)
     log.info("Missing=%s failures=%s", missing, len(parse_failures))
     log.info("T30 processed=%s", len(t30_processed))
+    log.info("Telegram result=%s", telegram_result)
     log.info("Finished in %s seconds", duration)
 
 
