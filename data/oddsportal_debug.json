@@ -1,6 +1,6 @@
 {
-  "started_at_utc": "2026-11-10T18:06:45+00:00",
-  "started_at_kyiv": "2026-11-10T20:06:45+02:00",
+  "started_at_utc": "2026-11-10T18:33:58+00:00",
+  "started_at_kyiv": "2026-11-10T20:33:58+02:00",
   "url": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
   "http_status": 200,
   "page_title": "Dropping Odds – Live Updates & Betting Tips | Odds Portal",
@@ -12,14 +12,22 @@
   "horizon_rows": 3,
   "qualifying_rows": 1,
   "signals": 1,
-  "new_database_records": 2,
+  "new_database_records": 3,
   "t30_processed": [],
+  "telegram": {
+    "pending": 1,
+    "sent": 0,
+    "failed": 0,
+    "configured": false
+  },
+  "telegram_pending_total": 1,
+  "telegram_sent_total": 0,
   "horizon_days": 7,
   "snapshot_interval_minutes": 15,
   "t30_target_minutes": 30,
   "t30_tolerance_minutes": 15,
   "timezone": "Europe/Kyiv",
-  "source_time_assumption": "OddsPortal displayed match time treated as UTC",
+  "source_time_assumption": "OddsPortal displayed match time treated as UTC; must be independently verified",
   "criteria": {
     "criterion_1": {
       "old_min": 4.0,
@@ -38,11 +46,12 @@
     "over-under",
     "total"
   ],
-  "history_policy": "old odds_history rows preserved; new records only 1X2 and Total",
-  "snapshot_policy": "every run stores an observation for discovered matches in 7-day horizon",
-  "t30_policy": "nearest stored snapshot within +/-15 minutes of kickoff minus 30 minutes; otherwise UNAVAILABLE",
-  "t30_limitation": "snapshots are sourced from Dropping Odds only; no independent match-page refresh",
-  "signal_policy": "one NORMAL signal per match if at least one qualifying 1X2 or Total FT row exists",
+  "history_policy": "Old odds_history rows preserved; new records only 1X2 and Total",
+  "snapshot_policy": "Snapshots are stored for discovered matches with known kickoff inside the 7-day horizon",
+  "t30_policy": "Nearest stored snapshot within +/-15 minutes of kickoff minus 30 minutes; otherwise UNAVAILABLE",
+  "t30_limitation": "Snapshots are sourced from Dropping Odds only; no independent match-page refresh",
+  "signal_policy": "One NORMAL signal per match if at least one qualifying 1X2 or Total FT row exists",
+  "telegram_policy": "Persistent outbox; one notification record per match_key; pending messages retried on subsequent runs",
   "signal_periods": [
     "FT"
   ],
@@ -57,8 +66,7 @@
     "selection": 0
   },
   "market_group_counts": {
-    "1X2": 2,
-    "total": 1
+    "1X2": 3
   },
   "period_counts": {
     "FT": 3
@@ -74,22 +82,22 @@
     {
       "card": 4,
       "reason": "exact_duplicate_row",
-      "anchor_text": "Colchester - Ipswich U21"
+      "anchor_text": "Grimsby - Nottingham U21"
     },
     {
       "card": 5,
       "reason": "exact_duplicate_row",
-      "anchor_text": "Chambery - Grenoble"
+      "anchor_text": "Colchester - Ipswich U21"
     },
     {
       "card": 6,
       "reason": "exact_duplicate_row",
-      "anchor_text": "Once Caldas - Atl. Nacional"
+      "anchor_text": "Chambery - Grenoble"
     }
   ],
   "signal_samples": [
     {
-      "scraped_at": "2026-11-10T18:06:45+00:00",
+      "scraped_at": "2026-11-10T18:33:58+00:00",
       "teams": "Colchester - Ipswich U21",
       "country": "England",
       "country_slug": "england",
@@ -100,13 +108,13 @@
       "market_count": 1,
       "market_groups": "1X2",
       "priority": "NORMAL",
-      "markets": "1X2 [2] 4.82 -> 2.15 | Вибір: Ipswich U21",
+      "markets": "1X2 | Вибір: 2 | Старий: 4.82 | Новий: 2.14 | Падіння: 56.00%",
       "match_url": "https://www.oddsportal.com/football/h2h/colchester-xYu73rNn/ipswich-KUHl7YSb",
       "match_key": "https://www.oddsportal.com/football/h2h/colchester-xyu73rnn/ipswich-kuhl7ysb"
     }
   ],
-  "body_preview": "Decimal Odds Decimal Odds (1.50) Fractional Odds (1/2) Money Line Odds (-200) Hong Kong Odds (0.50) Malay Odds (0.50) Indonesian Odds (-2.00) English English Polski LOGIN REGISTER ODDS COMPARISON COMMUNITY BOOKMAKERS Bet $5 Daily, Get Up To $350 In Bet Resets! CLAIM To claim, new users need to register, make a first-time deposit of $5 or more, and then simply place their first real-money wager on any FanDuel Sportsbook market (no odds limits) that is live on platform. All users will receive their $150 in Bonus Bets If Your Bet Wins within 72 hours of the bet settlement. HOME DROPPING ODDS SURE BETS BETTING TOOLS BETTING MY LEAGUES 0 Manage my leagues FOOTBALL Today's matches Popular LaLiga (21) Premier League (20) Bundesliga (19) Serie A (20) Champions League (18) Europa League (18) Ligue 1 (18) Euro U21 (4) All countries BASKETBALL TENNIS BASEBALL HOCKEY AMERICAN FOOTBALL AUSSIE RULES BADMINTON BANDY BOXING CRICKET DARTS ESPORTS FLOORBALL FUTSAL HANDBALL MMA RUGBY LEAGUE RUGBY UNION SNOOKER VOLLEYBALL WATER POLO Home > Dropping Odds Dropping Odds Dropping odds with OddsPortal enables you to find the online bookmakers that have not yet noticed that there have been big price changes in certain markets with other betting sites. Odds could be dropping due to a player injury or illness throughout a team, or because one team has potentially decided to play a weaker side ahead of a game. Some online betting sites may take notice, while others may not, allowing you to take advantage before there is any odds movement with certain bookmakers. Check out our page today for all of the best dropping odds tips across several different markets, while you can even filter it to a specific market or sport you are interested in. Filter Last 1 hour Last 12 hours Last 24 hours 10% dropping bookies 20% dropping bookies 30% dropping bookies 40% dropping bookies 50% dropping bookies All types 1X2 Over/Under 1X2 FT Only Home/Away Double Chance Asian Handicap Draw No Bet To Qualify Half Time / Full Time Odd or Even European Handicap Both Teams to Score All sports Football Basketball Tennis Rugby Union Football / England / EFL Trophy EH +3 2 Best Current Odds Today 19:45 Colchester - Ipswich U21 -66% 40.20 13.50 13.00 Football / England / EFL Trophy EH +2 2 Best Current Odds Today 19:00 Grimsby - Nottingham U21 -63% 35.50 13.00 8.00 Football / England / EFL Trophy HT/FT 2/2 Best Current Odds Today 19:45 Colchester - Ipswich U21 -58% 7.78 3.28 3.40 Football / England / EFL Trophy EH +1 2 Best Current Odds Today 19:45 Colchester - Ipswich U21 -58% 8.62 3.58 3.40 Football / England / EFL Trophy DNB 2 Best Current Odds Today 19:45 Colchester - Ipswich U21 -57% 3.95 1.68 1.71 Football / France / Coupe de France HT/FT 1/1 Best Current Odds 12 Nov 18:00 Chambery - Grenoble -56% 47.64 20.73 26.00 Football / England / EFL Trophy AH +1.25 2 Best Current Odds Today 19:45 Colchester - Ipswich U21 -56% 7.00 3.10 3.10 Football / England / EFL Trophy 1X2 2 Best Current Odds Today 19:45 C",
-  "duration_seconds": 8.08,
-  "finished_at_utc": "2026-11-10T18:06:53+00:00",
+  "body_preview": "Decimal Odds Decimal Odds (1.50) Fractional Odds (1/2) Money Line Odds (-200) Hong Kong Odds (0.50) Malay Odds (0.50) Indonesian Odds (-2.00) English English Polski LOGIN REGISTER ODDS COMPARISON COMMUNITY BOOKMAKERS Bet $5 Daily, Get Up To $350 In Bet Resets! CLAIM To claim, new users need to register, make a first-time deposit of $5 or more, and then simply place their first real-money wager on any FanDuel Sportsbook market (no odds limits) that is live on platform. All users will receive their $150 in Bonus Bets If Your Bet Wins within 72 hours of the bet settlement. HOME DROPPING ODDS SURE BETS BETTING TOOLS BETTING MY LEAGUES 0 Manage my leagues FOOTBALL Today's matches Popular LaLiga (21) Premier League (20) Bundesliga (19) Serie A (20) Champions League (18) Europa League (18) Ligue 1 (18) Euro U21 (4) All countries BASKETBALL TENNIS BASEBALL HOCKEY AMERICAN FOOTBALL AUSSIE RULES BADMINTON BANDY BOXING CRICKET DARTS ESPORTS FLOORBALL FUTSAL HANDBALL MMA RUGBY LEAGUE RUGBY UNION SNOOKER VOLLEYBALL WATER POLO Bet $10 Get $200 Win or Lose CLAIM No matter if your bet wins or loses. Deposit required. Paid in Bonus Bets. Bonus Bets wager excluded from returns. New customers only. Max. prize, game restrictions, time limits and T&Cs apply. 21+. Gambling Problem? Call 1-800-GAMBLER. Get up to $1,500 paid back in bonus bets, if you don`t win ! CLAIM Gambling problem? Call 1-800-GAMBLER or 1-800-MY-RESET. 21+ only. Please Gamble Responsibly. See BetMGM.com for Terms. First Bet Offer for new customers only (if applicable). Subject to eligibility requirements. Bonus bets are non-withdrawable. In partnership with Kansas Crossing Casino and Hotel. Promotional offers not available in Mississippi, New York, Ontario, or Puerto Rico. Bet $5, Get $100 in Bonus Bets Instantly! CLAIM 21+ and present in most states. (18+ DC/KY/NH/PR/WY). Void in NH/OR/ONT/PR. Eligibility restrictions apply. On behalf of Boot Hill Casino (KS). Pass-thru of per wager tax may apply in IL. 1 per new DraftKings customer. $5+ first-time bet req. Max. $100 issued as non-withdrawable Bonus Bets that expire in 7 days (168 hours). Stake removed from payout. Terms: sportsbook.draftkings.com/promos. Ends 5/31/26 at 11:59 PM ET. Home > Dropping Odds Dropping Odds Dropping odds with OddsPortal enables you to find the online bookmakers that have not yet noticed that there have been big price changes in certain markets with other betting sites. Odds could be dropping due to a player injury or illness throughout a team, or because one team has potentially decided to play a weaker side ahead of a game. Some online betting sites may take notice, while others may not, allowing you to take advantage before there is any odds movement with certain bookmakers. Check out our page today for all of the best dropping odds tips across several different markets, while you can even filter it to a specific market or sport you are interested in. Filter Last 1 hour Last 12 hours Last 24 hours 10% dropping bookies",
+  "duration_seconds": 7.97,
+  "finished_at_utc": "2026-11-10T18:34:06+00:00",
   "result": "completed"
 }
