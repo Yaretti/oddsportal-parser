@@ -5,31 +5,35 @@
 """
 GREENLINE ODDS — OddsPortal Dropping Odds Parser
 
-ДОЗВОЛЕНІ РИНКИ:
+MARKETS:
 - 1X2
-- Over/Under (Total)
+- Total (Over/Under)
 
-КРИТЕРІЇ ПЕРШОГО СИГНАЛУ:
-1) Старий коефіцієнт 4.00–6.00 включно, новий <= 2.50.
-2) Старий коефіцієнт 2.00–3.00 включно, новий <= 1.80.
+INITIAL SIGNAL:
+1) Old odds 4.00-6.00 inclusive, new odds <= 2.50.
+2) Old odds 2.00-3.00 inclusive, new odds <= 1.80.
 
-ПОВТОРНИЙ СИГНАЛ:
-- Додаткове падіння поточного коефіцієнта на 10% або більше
-  від останнього успішно надісланого коефіцієнта.
-- Окремий облік кожного ринку, вибору та лінії тоталу.
-- Після успішної відправки новий коефіцієнт стає базовим.
+REPEAT:
+- Current odds must fall at least 10% below the last
+  successfully sent odds for the same selection.
+- State is tracked separately for every market/selection/line.
+
+DATABASE:
+- Uses versioned v2 tables.
+- Existing database tables are NOT deleted or modified.
 
 TELEGRAM:
-- Один об'єднаний допис на матч за один цикл.
-- Без NORMAL.
-- Без посилання на матч.
-- Формат GREENLINE ODDS.
+- One combined message per match per scan.
+- No NORMAL label.
+- No match link.
 
-ВАЖЛИВО:
-- Час OddsPortal інтерпретується як UTC. Це припущення,
-  яке необхідно перевірити на відомому матчі.
-- T-30 використовує найближчий збережений snapshot,
-  а не незалежне оновлення сторінки матчу.
+TIME:
+- OddsPortal kickoff time is assumed UTC.
+- This assumption requires verification.
+
+T-30:
+- Uses nearest stored snapshot within +/-15 minutes.
+- Does not independently refresh match odds.
 """
 
 import csv
@@ -53,7 +57,7 @@ from playwright.sync_api import sync_playwright
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -65,17 +69,18 @@ SOURCE_URL = os.getenv(
     "https://www.oddsportal.com/dropping-odds/2/2/0/overall/"
 )
 
-HEADLESS = os.getenv("ODDSPORTAL_HEADLESS", "true").lower() != "false"
+HEADLESS = os.getenv(
+    "ODDSPORTAL_HEADLESS", "true"
+).lower() != "false"
+
 TIMEOUT_MS = 60000
 
 HORIZON_DAYS = 7
+
 REPEAT_DROP = 0.10
 
 T30_MINUTES = 30
 T30_TOLERANCE = 15
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 UTC = timezone.utc
 KYIV = ZoneInfo("Europe/Kyiv")
@@ -172,6 +177,7 @@ MOVEMENT_FIELDS = [
     "market_code",
     "period",
     "selection",
+    "handicap_line",
     "current_odds",
     "change_15m_pct",
     "change_30m_pct",
@@ -187,6 +193,7 @@ T30_FIELDS = [
     "checkpoint_status",
     "market_code",
     "selection",
+    "handicap_line",
     "checkpoint_odds",
     "qualifies_at_t30",
 ]
@@ -285,21 +292,26 @@ def make_match_key(teams, url):
 
 
 def make_series_key(row):
-    """
-    Окремий ключ для кожного:
-    - матчу;
-    - ринку;
-    - періоду;
-    - вибору;
-    - лінії тоталу.
-    """
-
     return sha256(
         row.get("match_key"),
         row.get("market_code"),
         row.get("period"),
         row.get("selection"),
-        row.get("handicap_line"),
+        clean(row.get("handicap_line")),
+    )
+
+
+def is_in_horizon(row, reference=None):
+    kickoff = parse_datetime(row.get("match_datetime"))
+
+    if not kickoff:
+        return False
+
+    reference = reference or now_utc()
+
+    return (
+        reference <= kickoff
+        <= reference + timedelta(days=HORIZON_DAYS)
     )
 
 
@@ -454,6 +466,36 @@ COUNTRIES = {
     "mexico": ("Mexico", "🇲🇽"),
     "japan": ("Japan", "🇯🇵"),
     "australia": ("Australia", "🇦🇺"),
+    "ireland": ("Ireland", "🇮🇪"),
+    "northern-ireland": ("Northern Ireland", "🇬🇧"),
+    "sweden": ("Sweden", "🇸🇪"),
+    "norway": ("Norway", "🇳🇴"),
+    "denmark": ("Denmark", "🇩🇰"),
+    "finland": ("Finland", "🇫🇮"),
+    "switzerland": ("Switzerland", "🇨🇭"),
+    "austria": ("Austria", "🇦🇹"),
+    "croatia": ("Croatia", "🇭🇷"),
+    "serbia": ("Serbia", "🇷🇸"),
+    "romania": ("Romania", "🇷🇴"),
+    "czech-republic": ("Czech Republic", "🇨🇿"),
+    "slovakia": ("Slovakia", "🇸🇰"),
+    "bulgaria": ("Bulgaria", "🇧🇬"),
+    "cyprus": ("Cyprus", "🇨🇾"),
+    "south-korea": ("South Korea", "🇰🇷"),
+    "china": ("China", "🇨🇳"),
+    "india": ("India", "🇮🇳"),
+    "saudi-arabia": ("Saudi Arabia", "🇸🇦"),
+    "united-arab-emirates": ("UAE", "🇦🇪"),
+    "south-africa": ("South Africa", "🇿🇦"),
+    "jamaica": ("Jamaica", "🇯🇲"),
+    "canada": ("Canada", "🇨🇦"),
+    "chile": ("Chile", "🇨🇱"),
+    "colombia": ("Colombia", "🇨🇴"),
+    "peru": ("Peru", "🇵🇪"),
+    "ecuador": ("Ecuador", "🇪🇨"),
+    "paraguay": ("Paraguay", "🇵🇾"),
+    "uruguay": ("Uruguay", "🇺🇾"),
+    "venezuela": ("Venezuela", "🇻🇪"),
 }
 
 
@@ -482,10 +524,10 @@ def parse_country_league(links):
         if len(parts) == 3 and parts[0] == "football":
             slug = parts[1]
 
-            if slug in COUNTRIES:
-                country = COUNTRIES[slug][0]
-            else:
-                country = slug.replace("-", " ").title()
+            country = COUNTRIES.get(
+                slug,
+                (slug.replace("-", " ").title(), "🌍")
+            )[0]
 
             league = clean(link.get("text", ""))
 
@@ -500,16 +542,16 @@ def parse_country_league(links):
 def parse_match_time(text, scraped_at):
     text = clean(text)
 
+    base = parse_datetime(scraped_at)
+
+    if not base:
+        return "", "", ""
+
     relative = re.search(
         r"\b(Today|Tomorrow|Yesterday)\s+(\d{1,2}:\d{2})",
         text,
         re.I
     )
-
-    base = parse_datetime(scraped_at)
-
-    if not base:
-        return "", "", ""
 
     if relative:
         word = relative.group(1).lower()
@@ -522,8 +564,7 @@ def parse_match_time(text, scraped_at):
         }
 
         date_value = (
-            base.date()
-            + timedelta(days=days[word])
+            base.date() + timedelta(days=days[word])
         )
 
     else:
@@ -551,17 +592,25 @@ def parse_match_time(text, scraped_at):
 
         clock = found.group(3)
 
-        year = base.year
+        possible_dates = []
 
-        try:
-            date_value = datetime(
-                year,
-                month,
-                day
-            ).date()
+        for year in (base.year - 1, base.year, base.year + 1):
+            try:
+                possible_dates.append(
+                    datetime(year, month, day).date()
+                )
+            except ValueError:
+                pass
 
-        except ValueError:
+        if not possible_dates:
             return "", "", ""
+
+        date_value = min(
+            possible_dates,
+            key=lambda d: abs(
+                (d - base.date()).days
+            )
+        )
 
     try:
         naive = datetime.strptime(
@@ -569,7 +618,7 @@ def parse_match_time(text, scraped_at):
             "%Y-%m-%d %H:%M"
         )
 
-        # ПРИПУЩЕННЯ: час OddsPortal є UTC.
+        # Припущення: час OddsPortal є UTC.
         kickoff_utc = naive.replace(tzinfo=UTC)
 
         kickoff_kyiv = kickoff_utc.astimezone(KYIV)
@@ -585,7 +634,7 @@ def parse_match_time(text, scraped_at):
 
 
 # ============================================================
-# ODDS PORTAL DOM EXTRACTION
+# ODDSPORTAL DOM EXTRACTION
 # ============================================================
 
 EXTRACT_JS = r"""
@@ -768,7 +817,6 @@ def parse_card(card, scraped_at):
         return None
 
     displayed_drop = parse_drop(card.get("text", ""))
-
     calculated_drop = calculate_drop(old, new)
 
     if displayed_drop is None or calculated_drop is None:
@@ -783,9 +831,12 @@ def parse_card(card, scraped_at):
         if selection not in ("1", "X", "2"):
             return None
 
-    if market["market_group"] == "total":
+    elif market["market_group"] == "total":
         if selection not in ("Over", "Under"):
             return None
+
+    else:
+        return None
 
     period = detect_period(
         market["market"],
@@ -796,10 +847,10 @@ def parse_card(card, scraped_at):
         card.get("links", [])
     )
 
-    teams = ""
-
     home = clean(card.get("home"))
     away = clean(card.get("away"))
+
+    teams = ""
 
     if home and away:
         teams = f"{home} - {away}"
@@ -821,7 +872,6 @@ def parse_card(card, scraped_at):
         scraped_at
     )
 
-    # Якщо час не був знайдений в anchor, пробуємо текст картки.
     if not kickoff:
         date_text, time_text, kickoff = parse_match_time(
             card.get("text", ""),
@@ -857,12 +907,12 @@ def parse_card(card, scraped_at):
 
 
 # ============================================================
-# DATABASE
+# DATABASE — VERSIONED TABLES
 # ============================================================
 
 def initialize_db(conn):
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS odds_history (
+        CREATE TABLE IF NOT EXISTS odds_history_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             record_key TEXT UNIQUE,
             scraped_at TEXT,
@@ -877,11 +927,13 @@ def initialize_db(conn):
             market_group TEXT,
             period TEXT,
             selection TEXT,
+            selection_code TEXT,
             handicap_line TEXT,
             odds_old REAL,
             odds_new REAL,
             best_current_odds REAL,
             drop_pct REAL,
+            calculated_drop_pct REAL,
             qualifies INTEGER,
             match_url TEXT,
             match_key TEXT
@@ -889,10 +941,10 @@ def initialize_db(conn):
     """)
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS odds_snapshots (
+        CREATE TABLE IF NOT EXISTS odds_snapshots_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            observed_at_utc TEXT,
-            series_key TEXT,
+            observed_at_utc TEXT NOT NULL,
+            series_key TEXT NOT NULL,
             match_key TEXT,
             teams TEXT,
             match_datetime TEXT,
@@ -910,7 +962,17 @@ def initialize_db(conn):
     """)
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS telegram_signal_state (
+        CREATE INDEX IF NOT EXISTS idx_snapshots_v2_series_time
+        ON odds_snapshots_v2(series_key, observed_at_utc)
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_snapshots_v2_match
+        ON odds_snapshots_v2(match_key)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_signal_state_v2 (
             series_key TEXT PRIMARY KEY,
             match_key TEXT,
             last_sent_odds REAL NOT NULL,
@@ -924,7 +986,7 @@ def initialize_db(conn):
     """)
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS telegram_outbox (
+        CREATE TABLE IF NOT EXISTS telegram_outbox_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_key TEXT UNIQUE,
             match_key TEXT,
@@ -938,7 +1000,12 @@ def initialize_db(conn):
     """)
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS tracked_matches (
+        CREATE INDEX IF NOT EXISTS idx_outbox_events_status
+        ON telegram_outbox_events(status, id)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tracked_matches_v2 (
             match_key TEXT PRIMARY KEY,
             teams TEXT,
             kickoff_utc TEXT,
@@ -947,7 +1014,7 @@ def initialize_db(conn):
     """)
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS final_odds_t30 (
+        CREATE TABLE IF NOT EXISTS final_odds_t30_v2 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             match_key TEXT,
             series_key TEXT,
@@ -958,6 +1025,7 @@ def initialize_db(conn):
             checkpoint_status TEXT,
             market_code TEXT,
             selection TEXT,
+            handicap_line TEXT,
             checkpoint_odds REAL,
             qualifies_at_t30 INTEGER,
             UNIQUE(match_key, series_key)
@@ -989,13 +1057,17 @@ def save_history(conn, rows):
         )
 
         cursor = conn.execute("""
-            INSERT OR IGNORE INTO odds_history (
+            INSERT OR IGNORE INTO odds_history_v2 (
                 record_key, scraped_at, country, league, teams,
                 match_date, match_time, match_datetime, market,
                 market_code, market_group, period, selection,
-                handicap_line, odds_old, odds_new, best_current_odds,
-                drop_pct, qualifies, match_url, match_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                selection_code, handicap_line, odds_old, odds_new,
+                best_current_odds, drop_pct, calculated_drop_pct,
+                qualifies, match_url, match_key
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
         """, (
             record_key,
             row["scraped_at"],
@@ -1010,11 +1082,13 @@ def save_history(conn, rows):
             row["market_group"],
             row["period"],
             row["selection"],
+            row["selection_code"],
             row["handicap_line"],
             row["odds_old"],
             row["odds_new"],
             row["best_current_odds"],
             row["drop_pct"],
+            row["calculated_drop_pct"],
             int(row["qualifies"]),
             row["match_url"],
             row["match_key"],
@@ -1033,19 +1107,20 @@ def save_history(conn, rows):
 # ============================================================
 
 def save_snapshots(conn, rows, observed_at):
+    reference = now_utc()
+    horizon_end = reference + timedelta(days=HORIZON_DAYS)
+
     for row in rows:
         kickoff = parse_datetime(row["match_datetime"])
 
         if not kickoff:
             continue
 
-        if not (
-            now_utc() <= kickoff <= now_utc() + timedelta(days=HORIZON_DAYS)
-        ):
+        if not (reference <= kickoff <= horizon_end):
             continue
 
         conn.execute("""
-            INSERT OR IGNORE INTO odds_snapshots (
+            INSERT OR IGNORE INTO odds_snapshots_v2 (
                 observed_at_utc, series_key, match_key, teams,
                 match_datetime, market_code, market_group, period,
                 selection, handicap_line, odds_old, odds_new,
@@ -1069,7 +1144,7 @@ def save_snapshots(conn, rows, observed_at):
         ))
 
         conn.execute("""
-            INSERT INTO tracked_matches (
+            INSERT INTO tracked_matches_v2 (
                 match_key, teams, kickoff_utc, t30_status
             ) VALUES (?, ?, ?, 'PENDING')
             ON CONFLICT(match_key) DO UPDATE SET
@@ -1089,49 +1164,56 @@ def save_snapshots(conn, rows, observed_at):
 # ============================================================
 
 def get_snapshot(conn, series_key, target, tolerance=8):
-    start = iso_utc(target - timedelta(minutes=tolerance))
-    end = iso_utc(target + timedelta(minutes=tolerance))
+    start = iso_utc(
+        target - timedelta(minutes=tolerance)
+    )
+
+    end = iso_utc(
+        target + timedelta(minutes=tolerance)
+    )
 
     rows = conn.execute("""
-        SELECT observed_at_utc, best_current_odds, odds_new
-        FROM odds_snapshots
+        SELECT observed_at_utc, odds_new
+        FROM odds_snapshots_v2
         WHERE series_key=?
           AND observed_at_utc BETWEEN ? AND ?
-    """, (series_key, start, end)).fetchall()
+    """, (
+        series_key,
+        start,
+        end,
+    )).fetchall()
 
     candidates = []
 
-    for observed, best, new in rows:
+    for observed, odds in rows:
         dt = parse_datetime(observed)
-        odds = best if best is not None else new
 
-        if dt and odds:
+        if dt and odds is not None and odds > 0:
             candidates.append((
                 abs((dt - target).total_seconds()),
                 dt,
-                odds
+                float(odds),
             ))
 
     if not candidates:
         return None
 
-    _, dt, odds = min(candidates, key=lambda x: x[0])
+    _, dt, odds = min(
+        candidates,
+        key=lambda x: x[0]
+    )
 
     return dt, odds
 
 
 def calculate_movement(conn, rows):
     output = []
-    now = now_utc()
+    reference = now_utc()
 
     for row in rows:
-        current = (
-            row["best_current_odds"]
-            if row["best_current_odds"] is not None
-            else row["odds_new"]
-        )
+        current = row["odds_new"]
 
-        if current is None:
+        if current is None or current <= 0:
             continue
 
         snapshots = {}
@@ -1140,7 +1222,7 @@ def calculate_movement(conn, rows):
             snapshots[minutes] = get_snapshot(
                 conn,
                 make_series_key(row),
-                now - timedelta(minutes=minutes)
+                reference - timedelta(minutes=minutes),
             )
 
         def change(snapshot):
@@ -1153,12 +1235,13 @@ def calculate_movement(conn, rows):
             )
 
         output.append({
-            "calculated_at_utc": iso_utc(now),
+            "calculated_at_utc": iso_utc(reference),
             "match_key": row["match_key"],
             "teams": row["teams"],
             "market_code": row["market_code"],
             "period": row["period"],
             "selection": row["selection"],
+            "handicap_line": row["handicap_line"],
             "current_odds": current,
             "change_15m_pct": change(snapshots[15]),
             "change_30m_pct": change(snapshots[30]),
@@ -1173,11 +1256,11 @@ def calculate_movement(conn, rows):
 # ============================================================
 
 def process_t30(conn):
-    now = now_utc()
+    reference = now_utc()
 
     matches = conn.execute("""
         SELECT match_key, teams, kickoff_utc
-        FROM tracked_matches
+        FROM tracked_matches_v2
         WHERE t30_status='PENDING'
     """).fetchall()
 
@@ -1191,20 +1274,35 @@ def process_t30(conn):
 
         target = kickoff - timedelta(minutes=T30_MINUTES)
 
-        if now < target + timedelta(minutes=T30_TOLERANCE):
+        if reference < target + timedelta(minutes=T30_TOLERANCE):
             continue
 
         series = conn.execute("""
             SELECT DISTINCT series_key
-            FROM odds_snapshots
+            FROM odds_snapshots_v2
             WHERE match_key=?
         """, (match_key,)).fetchall()
+
+        if not series:
+            # Матч є, але збережених ринкових snapshot немає.
+            conn.execute("""
+                INSERT OR IGNORE INTO final_odds_t30_v2 (
+                    match_key, series_key, teams, kickoff_utc,
+                    target_t30_utc, checkpoint_status
+                ) VALUES (?, ?, ?, ?, ?, 'UNAVAILABLE')
+            """, (
+                match_key,
+                "__MATCH_LEVEL__",
+                teams,
+                iso_utc(kickoff),
+                iso_utc(target),
+            ))
 
         for (series_key,) in series:
             rows = conn.execute("""
                 SELECT observed_at_utc, market_code, selection,
-                       odds_old, best_current_odds, odds_new
-                FROM odds_snapshots
+                       handicap_line, odds_old, odds_new
+                FROM odds_snapshots_v2
                 WHERE series_key=?
                   AND observed_at_utc BETWEEN ? AND ?
             """, (
@@ -1215,7 +1313,7 @@ def process_t30(conn):
 
             if not rows:
                 conn.execute("""
-                    INSERT OR IGNORE INTO final_odds_t30 (
+                    INSERT OR IGNORE INTO final_odds_t30_v2 (
                         match_key, series_key, teams, kickoff_utc,
                         target_t30_utc, checkpoint_status
                     ) VALUES (?, ?, ?, ?, ?, 'UNAVAILABLE')
@@ -1238,9 +1336,9 @@ def process_t30(conn):
                 )
             )
 
-            observed, code, selection, old, best, new = chosen
+            observed, code, selection, line, old, new = chosen
 
-            current = best if best is not None else new
+            current = float(new) if new is not None else None
 
             qualifies = (
                 int(qualifies_odds(old, current))
@@ -1249,12 +1347,13 @@ def process_t30(conn):
             )
 
             conn.execute("""
-                INSERT OR IGNORE INTO final_odds_t30 (
+                INSERT OR IGNORE INTO final_odds_t30_v2 (
                     match_key, series_key, teams, kickoff_utc,
                     target_t30_utc, snapshot_utc,
                     checkpoint_status, market_code, selection,
-                    checkpoint_odds, qualifies_at_t30
-                ) VALUES (?, ?, ?, ?, ?, ?, 'AVAILABLE', ?, ?, ?, ?)
+                    handicap_line, checkpoint_odds,
+                    qualifies_at_t30
+                ) VALUES (?, ?, ?, ?, ?, ?, 'AVAILABLE', ?, ?, ?, ?, ?)
             """, (
                 match_key,
                 series_key,
@@ -1264,12 +1363,13 @@ def process_t30(conn):
                 observed,
                 code,
                 selection,
+                line,
                 current,
                 qualifies,
             ))
 
         conn.execute("""
-            UPDATE tracked_matches
+            UPDATE tracked_matches_v2
             SET t30_status='FINALIZED'
             WHERE match_key=?
         """, (match_key,))
@@ -1282,16 +1382,12 @@ def process_t30(conn):
 
 
 # ============================================================
-# TELEGRAM FORMAT
+# TELEGRAM MESSAGE FORMAT
 # ============================================================
 
 def current_odds(row):
-    value = row["best_current_odds"]
-
-    if value is None:
-        value = row["odds_new"]
-
-    return value
+    # Для сигналів використовуємо odds_new послідовно.
+    return row["odds_new"]
 
 
 def bet_name(row):
@@ -1343,7 +1439,7 @@ def build_message(signal):
             signal["match_date"],
             "%Y-%m-%d"
         ).strftime("%d.%m.%Y")
-    except ValueError:
+    except (ValueError, TypeError):
         date_text = signal["match_date"] or "Дата невідома"
 
     date_line = f"📅 {date_text}"
@@ -1392,6 +1488,7 @@ def build_message(signal):
 
 def eligible_rows(rows):
     result = []
+    reference = now_utc()
 
     for row in rows:
         if row["market_code"] not in ALLOWED_MARKETS:
@@ -1406,6 +1503,9 @@ def eligible_rows(rows):
         if not row["qualifies"]:
             continue
 
+        if not is_in_horizon(row, reference):
+            continue
+
         if current_odds(row) is None:
             continue
 
@@ -1414,45 +1514,73 @@ def eligible_rows(rows):
     return result
 
 
+def pending_series_keys(conn):
+    result = set()
+
+    records = conn.execute("""
+        SELECT state_updates
+        FROM telegram_outbox_events
+        WHERE status='PENDING'
+    """).fetchall()
+
+    for (raw,) in records:
+        try:
+            updates = json.loads(raw or "[]")
+
+            for item in updates:
+                result.add(item["series_key"])
+
+        except (ValueError, TypeError, KeyError):
+            continue
+
+    return result
+
+
 def prepare_signals(conn, rows, scraped_at):
     grouped = {}
 
+    pending = pending_series_keys(conn)
+
     for row in eligible_rows(rows):
         series_key = make_series_key(row)
-        current = current_odds(row)
+
+        # Не створюємо другий pending event для тієї ж серії.
+        if series_key in pending:
+            continue
+
+        current = float(current_odds(row))
 
         state = conn.execute("""
             SELECT last_sent_odds
-            FROM telegram_signal_state
+            FROM telegram_signal_state_v2
             WHERE series_key=?
         """, (series_key,)).fetchone()
 
         if state is None:
-            # Перший сигнал для цієї серії.
-            display_old = row["odds_old"]
-            display_drop = calculate_drop(
-                display_old,
-                current
-            )
+            display_old = float(row["odds_old"])
 
         else:
             last_sent = float(state[0])
 
-            # Повтор тільки після додаткового падіння >=10%.
-            if current > last_sent * (1 - REPEAT_DROP) + 1e-9:
+            # Падіння на 10% або більше від останнього
+            # успішно надісланого коефіцієнта.
+            threshold = last_sent * (1 - REPEAT_DROP)
+
+            if current > threshold + 1e-9:
                 continue
 
             display_old = last_sent
-            display_drop = calculate_drop(
-                last_sent,
-                current
-            )
+
+        display_drop = calculate_drop(
+            display_old,
+            current
+        )
 
         item = dict(row)
 
         item["series_key"] = series_key
-        item["current_odds"] = float(current)
-        item["display_old"] = float(display_old)
+        item["current_odds"] = current
+        item["display_old"] = display_old
         item["display_drop"] = float(display_drop or 0)
 
         grouped.setdefault(
@@ -1515,7 +1643,7 @@ def enqueue_signals(conn, signals):
         payload = build_message(signal)
 
         cursor = conn.execute("""
-            INSERT OR IGNORE INTO telegram_outbox (
+            INSERT OR IGNORE INTO telegram_outbox_events (
                 event_key, match_key, payload, state_updates,
                 created_at, status
             ) VALUES (?, ?, ?, ?, ?, 'PENDING')
@@ -1539,18 +1667,21 @@ def enqueue_signals(conn, signals):
 
 
 def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not token or not chat_id:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID не задано"
         )
 
     url = (
         f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+        f"{token}/sendMessage"
     )
 
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -1576,7 +1707,10 @@ def send_telegram(message):
 
         if not result.get("ok"):
             raise RuntimeError(
-                result.get("description", "Telegram API error")
+                result.get(
+                    "description",
+                    "Telegram API error"
+                )
             )
 
         return True
@@ -1608,12 +1742,15 @@ def process_outbox(conn, signals):
 
     pending = conn.execute("""
         SELECT id, match_key, payload, state_updates
-        FROM telegram_outbox
+        FROM telegram_outbox_events
         WHERE status='PENDING'
         ORDER BY id
     """).fetchall()
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not token or not chat_id:
         log.warning(
             "Telegram не налаштовано. Повідомлень у черзі: %s",
             len(pending)
@@ -1639,11 +1776,9 @@ def process_outbox(conn, signals):
 
             sent_at = iso_utc()
 
-            # Базовий коефіцієнт оновлюється лише після
-            # підтвердження успішної відправки Telegram.
             for item in updates:
                 conn.execute("""
-                    INSERT INTO telegram_signal_state (
+                    INSERT INTO telegram_signal_state_v2 (
                         series_key, match_key, last_sent_odds,
                         last_sent_at, market_code, market_group,
                         period, selection, handicap_line
@@ -1665,7 +1800,7 @@ def process_outbox(conn, signals):
                 ))
 
             conn.execute("""
-                UPDATE telegram_outbox
+                UPDATE telegram_outbox_events
                 SET status='SENT',
                     sent_at=?,
                     last_error=NULL
@@ -1686,7 +1821,7 @@ def process_outbox(conn, signals):
 
         except Exception as exc:
             conn.execute("""
-                UPDATE telegram_outbox
+                UPDATE telegram_outbox_events
                 SET last_error=?
                 WHERE id=?
             """, (
@@ -1704,20 +1839,22 @@ def process_outbox(conn, signals):
                 exc
             )
 
+    pending_count = conn.execute("""
+        SELECT COUNT(*)
+        FROM telegram_outbox_events
+        WHERE status='PENDING'
+    """).fetchone()[0]
+
     return {
         "queued": queued,
         "sent": sent,
         "failed": failed,
-        "pending": conn.execute("""
-            SELECT COUNT(*)
-            FROM telegram_outbox
-            WHERE status='PENDING'
-        """).fetchone()[0],
+        "pending": pending_count,
     }
 
 
 # ============================================================
-# CSV
+# CSV HELPERS
 # ============================================================
 
 def write_csv(path, rows, fields):
@@ -1771,7 +1908,7 @@ def export_snapshots(conn):
                market_code, market_group, period,
                selection, handicap_line, odds_old,
                odds_new, best_current_odds, match_datetime
-        FROM odds_snapshots
+        FROM odds_snapshots_v2
         ORDER BY observed_at_utc DESC
     """).fetchall()
 
@@ -1792,9 +1929,9 @@ def export_t30(conn):
         SELECT match_key, teams, kickoff_utc,
                target_t30_utc, snapshot_utc,
                checkpoint_status, market_code,
-               selection, checkpoint_odds,
+               selection, handicap_line, checkpoint_odds,
                qualifies_at_t30
-        FROM final_odds_t30
+        FROM final_odds_t30_v2
         ORDER BY kickoff_utc DESC
     """).fetchall()
 
@@ -1834,7 +1971,6 @@ def scrape():
         )
 
         page = context.new_page()
-
         page.set_default_timeout(TIMEOUT_MS)
 
         try:
@@ -1894,7 +2030,6 @@ def scrape():
 
 def main():
     started = time.time()
-
     scraped_at = iso_utc()
 
     log.info("GREENLINE ODDS started")
@@ -2000,9 +2135,11 @@ def main():
                 "match_time": signal["match_time"],
                 "market_count": len(signal["items"]),
                 "markets": " | ".join(
-                    f'{x["market"]}: {x["selection"]} '
-                    f'{x["display_old"]:.2f}->{x["current_odds"]:.2f}'
-                    for x in signal["items"]
+                    f'{item["market"]}: '
+                    f'{item["selection"]} '
+                    f'{item["display_old"]:.2f}'
+                    f'->{item["current_odds"]:.2f}'
+                    for item in signal["items"]
                 ),
                 "match_key": signal["match_key"],
             })
@@ -2020,19 +2157,29 @@ def main():
 
         state_count = conn.execute("""
             SELECT COUNT(*)
-            FROM telegram_signal_state
+            FROM telegram_signal_state_v2
         """).fetchone()[0]
 
         sent_count = conn.execute("""
             SELECT COUNT(*)
-            FROM telegram_outbox
+            FROM telegram_outbox_events
             WHERE status='SENT'
         """).fetchone()[0]
 
         pending_count = conn.execute("""
             SELECT COUNT(*)
-            FROM telegram_outbox
+            FROM telegram_outbox_events
             WHERE status='PENDING'
+        """).fetchone()[0]
+
+        history_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM odds_history_v2
+        """).fetchone()[0]
+
+        snapshot_count = conn.execute("""
+            SELECT COUNT(*)
+            FROM odds_snapshots_v2
         """).fetchone()[0]
 
     finally:
@@ -2062,6 +2209,8 @@ def main():
         ),
         "signal_events": len(signals),
         "new_history_records": len(added),
+        "history_records_v2": history_count,
+        "snapshot_records_v2": snapshot_count,
         "market_counts": market_counts,
         "t30_processed": t30_count,
         "telegram": telegram,
@@ -2070,12 +2219,14 @@ def main():
         "signal_state_series": state_count,
         "allowed_markets": sorted(ALLOWED_MARKETS),
         "repeat_rule": (
-            "current_odds <= last_successfully_sent_odds * 0.90"
+            "current odds_new <= last successfully sent odds * 0.90"
         ),
         "criteria": [
             "old 4.00-6.00 inclusive, new <=2.50",
             "old 2.00-3.00 inclusive, new <=1.80",
         ],
+        "database_version": "v2",
+        "old_database_tables_preserved": True,
         "timezone_assumption": (
             "OddsPortal displayed kickoff time is treated as UTC; "
             "this assumption requires verification."
@@ -2100,22 +2251,26 @@ def main():
     )
 
     log.info(
-        "Cards=%s parsed=%s qualifying=%s signals=%s",
+        "HTTP=%s Cards=%s parsed=%s qualifying=%s signals=%s",
+        result["status"],
         len(result["cards"]),
         len(rows),
         debug["qualifying_rows"],
         len(signals),
     )
 
+    log.info("Markets=%s", market_counts)
+
     log.info(
-        "Markets=%s",
-        market_counts
+        "History v2=%s Snapshots v2=%s",
+        history_count,
+        snapshot_count
     )
 
     log.info(
         "T30=%s Telegram=%s",
         t30_count,
-        telegram,
+        telegram
     )
 
     log.info(
