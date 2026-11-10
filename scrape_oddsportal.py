@@ -3,30 +3,33 @@
 # -*- coding: utf-8 -*-
 
 """
-OddsPortal Dropping Odds parser
+GREENLINE / OddsPortal Dropping Odds Parser
 
 Features:
-- Parses individual market selections.
-- Extracts old/new/best odds and validates displayed drop.
-- Identifies the team/outcome receiving the odds movement.
-- Separates 1X2, negative handicap, positive handicap and totals.
-- Applies the user's exact odds criteria.
-- Groups qualifying markets into NORMAL / HIGH / TOP.
-- Saves latest, history, signals, SQLite and debug files.
+- OddsPortal dropping odds extraction.
+- Old/new/best odds validation against displayed drop percentage.
+- Home/away team identification.
+- Flow direction and flow_to_team columns.
+- Separate 1X2, total, negative and positive handicap markets.
+- Exact user qualification criteria.
+- NORMAL / HIGH / TOP signal grouping.
+- SQLite automatic migration without deleting old history.
+- CSV latest, history and signals.
+- JSON diagnostics.
 
-IMPORTANT:
-The parser does not claim to know actual betting stake volume.
-Odds movement is not proof of money flow.
+Note:
+Odds movement is not proof of actual betting money volume.
+Unknown selections are not guessed.
 """
 
 import asyncio
 import csv
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
-import hashlib
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,15 +58,19 @@ LATEST_FILE = DATA_DIR / "oddsportal_latest.csv"
 HISTORY_FILE = DATA_DIR / "oddsportal_history.csv"
 SIGNALS_FILE = DATA_DIR / "oddsportal_signals.csv"
 DEBUG_FILE = DATA_DIR / "oddsportal_debug.json"
-HTML_DEBUG_FILE = DATA_DIR / "oddsportal_cards_debug.html"
+CARDS_DEBUG_FILE = DATA_DIR / "oddsportal_cards_debug.json"
 DB_FILE = DATA_DIR / "oddsportal_history.sqlite"
 
+PAGE_WAIT_MS = int(os.getenv("PAGE_WAIT_MS", "5000"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "5"))
-DROP_VALIDATION_TOLERANCE = float(
+DROP_TOLERANCE = float(
     os.getenv("DROP_VALIDATION_TOLERANCE", "2.5")
 )
 
-PAGE_WAIT_MS = int(os.getenv("PAGE_WAIT_MS", "5000"))
+# If true, parser tries to click a visible Next button.
+ENABLE_PAGINATION = (
+    os.getenv("ENABLE_PAGINATION", "true").lower() == "true"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,7 +79,7 @@ logging.basicConfig(
 
 
 # ============================================================
-# CSV SCHEMA
+# OUTPUT FIELDS
 # ============================================================
 
 FIELDS = [
@@ -85,84 +92,83 @@ FIELDS = [
     "home_team",
     "away_team",
     "match_time",
-
     "market",
     "market_code",
     "market_group",
-
     "selection",
     "selection_code",
     "handicap_line",
-
     "flow_direction",
     "flow_to_team",
     "flow_confidence",
-
     "drop_pct",
     "calculated_drop_pct",
-
     "odds_old",
     "odds_new",
     "best_current_odds",
-
     "qualifies",
     "match_url",
     "match_key",
     "record_key",
 ]
 
+SIGNAL_FIELDS = [
+    "scraped_at",
+    "priority",
+    "teams",
+    "home_team",
+    "away_team",
+    "country",
+    "league",
+    "match_time",
+    "qualifying_groups",
+    "qualifying_group_count",
+    "flow_targets",
+    "qualifying_markets",
+    "qualifying_selections",
+    "match_url",
+    "match_key",
+]
+
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
-def now_utc():
+def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def number(value):
+def clean_text(value):
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or "")
+    ).strip()
+
+
+def to_number(value):
     if value is None:
         return None
 
     try:
-        return float(str(value).replace(",", ".").strip())
+        return float(
+            str(value).replace(",", ".").strip()
+        )
     except (ValueError, TypeError):
         return None
 
 
-def clean_text(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def slug_to_name(value):
-    value = (value or "").replace("-", " ").replace("_", " ")
-    return " ".join(word.capitalize() for word in value.split())
-
-
-def split_teams(value):
-    value = clean_text(value)
-
-    separators = [
-        " - ",
-        " – ",
-        " — ",
-        " vs ",
-        " v ",
-    ]
-
-    for separator in separators:
-        if separator in value:
-            parts = value.split(separator, 1)
-            if len(parts) == 2:
-                return parts[0].strip(), parts[1].strip()
-
-    return value, ""
+def make_hash(value):
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()[:32]
 
 
 def canonical_match_url(url):
     """
-    Removes the market fragment.
-    Keeps the event URL as the match identifier.
+    Remove market fragment and query parameters.
+    The remaining event URL identifies the match.
     """
 
     if not url:
@@ -179,24 +185,76 @@ def canonical_match_url(url):
     ))
 
 
-def make_hash(value):
-    return hashlib.sha256(
-        value.encode("utf-8")
-    ).hexdigest()[:24]
+def split_teams(value):
+    value = clean_text(value)
+
+    separators = [
+        " - ",
+        " – ",
+        " — ",
+        " vs ",
+        " v ",
+    ]
+
+    for separator in separators:
+        if separator in value:
+            parts = value.split(separator, 1)
+
+            if len(parts) == 2:
+                return (
+                    clean_text(parts[0]),
+                    clean_text(parts[1]),
+                )
+
+    return value, ""
+
+
+def parse_match_time_and_teams(value):
+    """
+    Handles labels such as:
+    Tomorrow 01:30 Once Caldas - Atl. Nacional
+    Today 19:45 Colchester - Ipswich U21
+    18:00 Chambery - Grenoble
+    """
+
+    value = clean_text(value)
+
+    patterns = [
+        r"^(Today|Tomorrow)\s+(\d{1,2}:\d{2})\s+(.+)$",
+        r"^(\d{1,2}:\d{2})\s+(.+)$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, value, re.I)
+
+        if not match:
+            continue
+
+        if len(match.groups()) == 3:
+            match_time = (
+                f"{match.group(1)} {match.group(2)}"
+            )
+            teams = match.group(3)
+        else:
+            match_time = match.group(1)
+            teams = match.group(2)
+
+        return clean_text(match_time), clean_text(teams)
+
+    return "", value
 
 
 # ============================================================
-# URL MARKET PARSING
+# URL / MARKET PARSING
 # ============================================================
 
 def parse_market_fragment(url):
     """
     Examples:
-
-    #OISydU3L:over-under;2;6.50;0
-    #ITTAoLdt:1X2;2
-    #4z1nvQcc:eh;2;1.00;0
-    #zuiH5zFs:ah;2;0.75;0
+      #OISydU3L:over-under;2;6.50;0
+      #ITTAoLdt:1X2;2
+      #4z1nvQcc:eh;2;1.00;0
+      #zuiH5zFs:ah;2;0.75;0
     """
 
     result = {
@@ -206,7 +264,7 @@ def parse_market_fragment(url):
         "market_group": "other",
     }
 
-    if "#" not in (url or ""):
+    if not url or "#" not in url:
         return result
 
     fragment = url.split("#", 1)[1]
@@ -222,11 +280,13 @@ def parse_market_fragment(url):
     market_code = parts[0].strip().lower()
 
     selection_code = (
-        parts[1].strip() if len(parts) > 1 else ""
+        parts[1].strip()
+        if len(parts) > 1 else ""
     )
 
     line = (
-        number(parts[2]) if len(parts) > 2 else None
+        to_number(parts[2])
+        if len(parts) > 2 else None
     )
 
     result["market_code"] = market_code
@@ -235,7 +295,7 @@ def parse_market_fragment(url):
     if line is not None:
         result["handicap_line"] = f"{line:.2f}"
 
-    if market_code in ("1x2",):
+    if market_code == "1x2":
         result["market_group"] = "1X2"
 
     elif market_code in ("over-under", "total"):
@@ -257,25 +317,29 @@ def parse_market_fragment(url):
     return result
 
 
-def market_display(market_code, line):
+def market_display(market_code, handicap_line):
+    line = to_number(handicap_line)
+
     if market_code == "1x2":
         return "1X2"
 
     if market_code == "over-under":
-        if line:
-            return f"O/U {float(line):g}"
-        return "Over/Under"
+        return (
+            f"O/U {line:g}"
+            if line is not None
+            else "Over/Under"
+        )
 
     if market_code == "ah":
-        if line:
-            sign = "+" if float(line) > 0 else ""
-            return f"AH {sign}{float(line):g}"
+        if line is not None:
+            sign = "+" if line > 0 else ""
+            return f"AH {sign}{line:g}"
         return "Asian Handicap"
 
     if market_code == "eh":
-        if line:
-            sign = "+" if float(line) > 0 else ""
-            return f"EH {sign}{float(line):g}"
+        if line is not None:
+            sign = "+" if line > 0 else ""
+            return f"EH {sign}{line:g}"
         return "European Handicap"
 
     names = {
@@ -286,19 +350,113 @@ def market_display(market_code, line):
         "double-chance": "Double Chance",
     }
 
-    return names.get(market_code, market_code or "Unknown")
+    return names.get(
+        market_code,
+        market_code or "Unknown"
+    )
 
 
 # ============================================================
-# SELECTION AND TEAM FLOW
+# ODDS EXTRACTION AND VALIDATION
+# ============================================================
+
+def calculate_drop(old_odds, new_odds):
+    if old_odds is None or old_odds <= 0:
+        return None
+
+    if new_odds is None:
+        return None
+
+    return (
+        (new_odds - old_odds) / old_odds
+    ) * 100.0
+
+
+def extract_valid_odds(card_text):
+    """
+    Reads the displayed negative percentage and searches
+    for a consecutive odds triplet matching that percentage.
+
+    Example:
+      old = 59.00
+      new = 21.50
+      calculated drop = -63.56%
+      displayed drop = -64%
+    """
+
+    text = card_text or ""
+
+    drop_match = re.search(
+        r"(-\s*\d+(?:[.,]\d+)?)\s*%",
+        text
+    )
+
+    if not drop_match:
+        return None
+
+    displayed_drop = to_number(
+        drop_match.group(1).replace(" ", "")
+    )
+
+    if displayed_drop is None:
+        return None
+
+    remaining_text = text[drop_match.end():]
+
+    values = re.findall(
+        r"(?<![\w:])\d{1,5}(?:[.,]\d+)",
+        remaining_text
+    )
+
+    values = [
+        to_number(value)
+        for value in values
+    ]
+
+    values = [
+        value for value in values
+        if value is not None and value > 0
+    ]
+
+    if len(values) < 3:
+        return None
+
+    for index in range(len(values) - 2):
+        old_odds, new_odds, best_odds = (
+            values[index:index + 3]
+        )
+
+        calculated = calculate_drop(
+            old_odds,
+            new_odds
+        )
+
+        if calculated is None:
+            continue
+
+        if abs(calculated - displayed_drop) <= DROP_TOLERANCE:
+            return {
+                "drop_pct": displayed_drop,
+                "calculated_drop_pct": round(
+                    calculated,
+                    2
+                ),
+                "odds_old": old_odds,
+                "odds_new": new_odds,
+                "best_current_odds": best_odds,
+            }
+
+    return None
+
+
+# ============================================================
+# SELECTION PARSING
 # ============================================================
 
 def find_visible_selection(card_text, market_code):
     """
-    Reads the selection displayed in the market card.
-
-    It deliberately does not guess from arbitrary numeric
-    values in the odds table.
+    Uses visible market selection text.
+    Does not infer a selection from undocumented URL codes.
     """
 
     lines = [
@@ -307,30 +465,22 @@ def find_visible_selection(card_text, market_code):
         if clean_text(line)
     ]
 
-    normalized = [
-        line.lower()
-        for line in lines
-    ]
-
-    market_markers = (
-        "best current odds",
-        "best odds",
-    )
-
     stop_index = len(lines)
 
-    for i, line in enumerate(normalized):
-        if any(marker in line for marker in market_markers):
-            stop_index = i
+    for index, line in enumerate(lines):
+        if re.search(
+            r"Best Current Odds",
+            line,
+            re.I
+        ):
+            stop_index = index
             break
 
     candidates = lines[:stop_index]
 
     if market_code == "over-under":
         for line in candidates:
-            low = line.lower()
-
-            if low in ("over", "under"):
+            if line.lower() in ("over", "under"):
                 return line.title()
 
         return ""
@@ -341,51 +491,56 @@ def find_visible_selection(card_text, market_code):
                 return line.upper()
 
             if line.lower() in (
-                "draw",
                 "home",
+                "draw",
                 "away",
             ):
                 return line.title()
 
         return ""
 
-    if market_code in ("ah", "eh", "dnb", "qualify"):
+    # For handicap and other markets, use an explicit
+    # visible 1 / X / 2 selection only.
+    if market_code in (
+        "ah",
+        "eh",
+        "dnb",
+        "qualify",
+        "ht-ft",
+    ):
         for line in candidates:
-            if line.upper() in ("1", "2", "X"):
+            if line.upper() in ("1", "X", "2"):
                 return line.upper()
-
-        return ""
 
     return ""
 
 
+# ============================================================
+# FLOW TARGET
+# ============================================================
+
 def determine_flow(
     market_code,
     selection,
-    selection_code,
     home_team,
     away_team,
 ):
     """
-    Determines the outcome/team receiving the odds movement.
+    flow_to_team:
+      Home team / Away team / Draw / Over / Under.
 
-    A team is assigned only when the selection is explicit.
-
-    For 1X2, the known OddsPortal URL convention from the
-    supplied examples is used as a fallback only for code 2.
-    Other undocumented codes are not guessed.
+    If selection is unknown, do not guess.
     """
 
     selection = clean_text(selection)
     normalized = selection.lower()
 
-    result = {
+    unknown = {
         "flow_direction": "Не визначено",
         "flow_to_team": "Не визначено",
         "flow_confidence": "low",
     }
 
-    # TOTALS: no team is the target.
     if market_code == "over-under":
         if normalized == "over":
             return {
@@ -402,46 +557,11 @@ def determine_flow(
             }
 
         return {
-            "flow_direction": "Total: unknown",
-            "flow_to_team": "Тотал: вибір не визначено",
+            "flow_direction": "Тотал: вибір невідомий",
+            "flow_to_team": "Не визначено",
             "flow_confidence": "low",
         }
 
-    # 1X2
-    if market_code == "1x2":
-        if normalized in ("1", "home"):
-            return {
-                "flow_direction": "1 / Господарі",
-                "flow_to_team": home_team or "Господарі",
-                "flow_confidence": "high",
-            }
-
-        if normalized in ("2", "away"):
-            return {
-                "flow_direction": "2 / Гості",
-                "flow_to_team": away_team or "Гості",
-                "flow_confidence": "high",
-            }
-
-        if normalized in ("x", "draw"):
-            return {
-                "flow_direction": "X / Нічия",
-                "flow_to_team": "Нічия",
-                "flow_confidence": "high",
-            }
-
-        # Known example supplied earlier:
-        # 1X2;2 corresponds to the away selection.
-        if str(selection_code) == "2":
-            return {
-                "flow_direction": "2 / Гості (за кодом URL)",
-                "flow_to_team": away_team or "Гості",
-                "flow_confidence": "medium",
-            }
-
-        return result
-
-    # Handicap and other team-based markets.
     if normalized in ("1", "home"):
         return {
             "flow_direction": "1 / Господарі",
@@ -463,106 +583,32 @@ def determine_flow(
             "flow_confidence": "high",
         }
 
-    return result
+    return unknown
 
 
 # ============================================================
-# ODDS VALIDATION
+# USER QUALIFICATION CRITERIA
 # ============================================================
 
-def calculate_drop(old, new):
-    if not old or old <= 0:
-        return None
-
-    if new is None:
-        return None
-
-    return ((new - old) / old) * 100.0
-
-
-def extract_valid_odds(card_text, displayed_drop):
+def qualifies(old_odds, new_odds):
     """
-    Finds the first three odds values after the displayed
-    percentage that mathematically match the drop.
+    Rule 1:
+      Initial odds 4.00–5.00 inclusive
+      New odds <= 2.00
 
-    Example:
-    old=59.00, new=21.50 => -63.56%
-    displayed drop=-64%
+    Rule 2:
+      Initial odds 2.00–3.00 inclusive
+      New odds <= 1.80
     """
 
-    text = card_text or ""
-
-    drop_match = re.search(
-        r"(-\s*\d+(?:[.,]\d+)?)\s*%",
-        text
-    )
-
-    if not drop_match:
-        return None
-
-    drop = number(
-        drop_match.group(1).replace(" ", "")
-    )
-
-    after_drop = text[drop_match.end():]
-
-    values = re.findall(
-        r"(?<![\w:])\d{1,5}(?:[.,]\d+)",
-        after_drop
-    )
-
-    values = [
-        number(value)
-        for value in values
-    ]
-
-    values = [
-        value for value in values
-        if value is not None and value > 0
-    ]
-
-    if len(values) < 3:
-        return None
-
-    # Test consecutive triplets because page markup may
-    # contain extra numeric values.
-    for index in range(len(values) - 2):
-        old, new, best = values[index:index + 3]
-
-        calculated = calculate_drop(old, new)
-
-        if calculated is None:
-            continue
-
-        if abs(calculated - drop) <= DROP_VALIDATION_TOLERANCE:
-            return {
-                "drop_pct": drop,
-                "calculated_drop_pct": round(calculated, 2),
-                "odds_old": old,
-                "odds_new": new,
-                "best_current_odds": best,
-            }
-
-    return None
-
-
-# ============================================================
-# QUALIFICATION
-# ============================================================
-
-def qualifies(old, new):
-    if old is None or new is None:
+    if old_odds is None or new_odds is None:
         return False
 
-    # Rule 1:
-    # Initial odds 4.00–5.00 -> new odds <= 2.00
-    if 4.00 <= old <= 5.00 and new <= 2.00:
-        return True
+    if 4.00 <= old_odds <= 5.00:
+        return new_odds <= 2.00
 
-    # Rule 2:
-    # Initial odds 2.00–3.00 -> new odds <= 1.80
-    if 2.00 <= old <= 3.00 and new <= 1.80:
-        return True
+    if 2.00 <= old_odds <= 3.00:
+        return new_odds <= 1.80
 
     return False
 
@@ -571,58 +617,34 @@ def qualifies(old, new):
 # CARD PARSING
 # ============================================================
 
-def parse_event_time_and_teams(raw_label):
-    raw_label = clean_text(raw_label)
-
-    patterns = [
-        r"^(Today|Tomorrow)\s+(\d{1,2}:\d{2})\s+(.+)$",
-        r"^(\d{1,2}\s+\w+)\s+(\d{1,2}:\d{2})\s+(.+)$",
-    ]
-
-    for pattern in patterns:
-        match = re.match(pattern, raw_label, re.I)
-
-        if match:
-            match_time = (
-                f"{match.group(1)} {match.group(2)}"
-            )
-            teams = match.group(3).strip()
-            return match_time, teams
-
-    return "", raw_label
-
-
 def parse_card(card):
-    url = urljoin(SOURCE_URL, card.get("url", ""))
+    url = urljoin(
+        SOURCE_URL,
+        card.get("url", "")
+    )
 
-    raw_label = card.get("teams", "")
-    match_time, teams = parse_event_time_and_teams(raw_label)
+    match_time, teams = parse_match_time_and_teams(
+        card.get("teams", "")
+    )
 
     home_team, away_team = split_teams(teams)
 
     if not home_team or not away_team:
-        return None
+        return None, "teams_not_parsed"
 
     market_data = parse_market_fragment(url)
 
     market_code = market_data["market_code"]
-    selection_code = market_data["selection_code"]
-    handicap_line = market_data["handicap_line"]
 
-    market_group = market_data["market_group"]
-
-    market = market_display(
-        market_code,
-        handicap_line
-    )
+    if not market_code:
+        return None, "market_code_missing"
 
     odds_data = extract_valid_odds(
-        card.get("text", ""),
-        None
+        card.get("text", "")
     )
 
     if not odds_data:
-        return None
+        return None, "odds_not_validated"
 
     selection = find_visible_selection(
         card.get("text", ""),
@@ -632,7 +654,6 @@ def parse_card(card):
     flow = determine_flow(
         market_code,
         selection,
-        selection_code,
         home_team,
         away_team,
     )
@@ -640,17 +661,32 @@ def parse_card(card):
     match_url = canonical_match_url(url)
     match_key = make_hash(match_url)
 
-    record_identity = "|".join([
+    handicap_line = market_data["handicap_line"]
+    selection_code = market_data["selection_code"]
+
+    market = market_display(
+        market_code,
+        handicap_line
+    )
+
+    # Include the odds state in the record key.
+    # This allows a later odds movement to be stored
+    # as a new history record for the same selection.
+    identity = "|".join([
         match_key,
         market_code,
         selection_code,
-        str(handicap_line),
+        handicap_line,
+        selection,
+        str(odds_data["odds_old"]),
+        str(odds_data["odds_new"]),
+        str(odds_data["best_current_odds"]),
     ])
 
-    record_key = make_hash(record_identity)
+    record_key = make_hash(identity)
 
-    return {
-        "scraped_at": now_utc(),
+    row = {
+        "scraped_at": utc_now(),
 
         "sport": "Football",
         "country": card.get("country", ""),
@@ -664,7 +700,7 @@ def parse_card(card):
 
         "market": market,
         "market_code": market_code,
-        "market_group": market_group,
+        "market_group": market_data["market_group"],
 
         "selection": selection or "Не визначено",
         "selection_code": selection_code,
@@ -675,11 +711,15 @@ def parse_card(card):
         "flow_confidence": flow["flow_confidence"],
 
         "drop_pct": odds_data["drop_pct"],
-        "calculated_drop_pct": odds_data["calculated_drop_pct"],
+        "calculated_drop_pct": odds_data[
+            "calculated_drop_pct"
+        ],
 
         "odds_old": odds_data["odds_old"],
         "odds_new": odds_data["odds_new"],
-        "best_current_odds": odds_data["best_current_odds"],
+        "best_current_odds": odds_data[
+            "best_current_odds"
+        ],
 
         "qualifies": qualifies(
             odds_data["odds_old"],
@@ -691,38 +731,50 @@ def parse_card(card):
         "record_key": record_key,
     }
 
+    return row, None
+
 
 # ============================================================
-# BROWSER EXTRACTION
+# PLAYWRIGHT CARD EXTRACTION
 # ============================================================
 
 async def extract_cards(page):
-    return await page.locator(
+    """
+    Finds match links and their closest market-card container.
+
+    Country and league are read from the card's football
+    breadcrumb links when available.
+    """
+
+    cards = await page.locator(
         'a[href*="/football/h2h/"]'
     ).evaluate_all("""
         anchors => {
             const output = [];
             const seen = new Set();
 
-            for (const a of anchors) {
-                const href = a.href || "";
-                const label = (a.innerText || "").trim();
+            for (const anchor of anchors) {
+                const href = anchor.href || "";
+                const label = (anchor.innerText || "").trim();
 
                 if (!href || !label) continue;
 
-                let node = a;
+                let node = anchor;
                 let selected = null;
 
                 for (let depth = 0; depth < 14 && node; depth++) {
                     const text = (node.innerText || "").trim();
 
-                    const hasDrop = /-\\s*\\d+(?:[.,]\\d+)?\\s*%/.test(text);
-                    const hasBest = /Best Current Odds/i.test(text);
+                    const hasDrop =
+                        /-\\s*\\d+(?:[.,]\\d+)?\\s*%/.test(text);
+
+                    const hasBest =
+                        /Best Current Odds/i.test(text);
 
                     if (
                         hasDrop &&
                         hasBest &&
-                        text.length < 3500
+                        text.length < 5000
                     ) {
                         selected = node;
                         break;
@@ -733,10 +785,11 @@ async def extract_cards(page):
 
                 if (!selected) continue;
 
-                const cardText = (selected.innerText || "").trim();
+                const cardText = (
+                    selected.innerText || ""
+                ).trim();
 
-                // Avoid duplicate DOM anchors pointing to
-                // exactly the same market card.
+                // A card URL includes a market fragment.
                 const key = href.toLowerCase();
 
                 if (seen.has(key)) continue;
@@ -746,26 +799,52 @@ async def extract_cards(page):
                 let countrySlug = "";
                 let league = "";
 
-                const links = selected.querySelectorAll(
-                    'a[href*="/football/"]'
-                );
+                const breadcrumbLinks = [
+                    ...selected.querySelectorAll(
+                        'a[href*="/football/"]'
+                    )
+                ];
 
-                for (const link of links) {
-                    const linkHref = link.getAttribute("href") || "";
-                    const parts = linkHref.split("/").filter(Boolean);
+                const breadcrumbData = [];
 
-                    // /football/country/competition/
+                for (const link of breadcrumbLinks) {
+                    const linkHref =
+                        link.getAttribute("href") || "";
+
+                    const linkText =
+                        (link.innerText || "").trim();
+
+                    if (
+                        !linkText ||
+                        linkHref.includes("/h2h/")
+                    ) {
+                        continue;
+                    }
+
+                    const parts = linkHref
+                        .split("/")
+                        .filter(Boolean);
+
                     if (
                         parts.length >= 3 &&
-                        parts[0] === "football" &&
-                        !linkHref.includes("/h2h/")
+                        parts[0] === "football"
                     ) {
-                        countrySlug = parts[1] || "";
-                        country = (link.innerText || "").trim();
-                        league = (link.innerText || "").trim();
-
-                        if (countrySlug && league) break;
+                        breadcrumbData.push({
+                            slug: parts[1],
+                            text: linkText
+                        });
                     }
+                }
+
+                if (breadcrumbData.length >= 1) {
+                    countrySlug = breadcrumbData[0].slug;
+                    country = breadcrumbData[0].text;
+                }
+
+                if (breadcrumbData.length >= 2) {
+                    league = breadcrumbData[
+                        breadcrumbData.length - 1
+                    ].text;
                 }
 
                 output.push({
@@ -782,15 +861,63 @@ async def extract_cards(page):
         }
     """)
 
+    return cards
+
+
+async def click_next_page(page):
+    """
+    Click only a visible enabled button explicitly named Next.
+    """
+
+    candidates = [
+        page.get_by_role(
+            "button",
+            name=re.compile(r"^Next$", re.I)
+        ),
+        page.get_by_role(
+            "link",
+            name=re.compile(r"^Next$", re.I)
+        ),
+    ]
+
+    for locator in candidates:
+        try:
+            if await locator.count() == 0:
+                continue
+
+            button = locator.first
+
+            if not await button.is_visible():
+                continue
+
+            if not await button.is_enabled():
+                continue
+
+            await button.click(timeout=5000)
+            await page.wait_for_timeout(3000)
+
+            return True
+
+        except Exception:
+            continue
+
+    return False
+
+
+# ============================================================
+# SCRAPING
+# ============================================================
 
 async def scrape():
     rows = []
     failures = []
-    html_samples = []
+    debug_cards = []
 
     debug = {
-        "started_at": now_utc(),
-        "url": SOURCE_URL,
+        "started_at": utc_now(),
+        "source_url": SOURCE_URL,
+        "http_status": None,
+        "final_url": "",
         "pages_scanned": 0,
         "cards_found": 0,
         "parsed_rows": 0,
@@ -798,11 +925,13 @@ async def scrape():
         "duplicate_records": 0,
         "qualifying_rows": 0,
         "signals": 0,
+        "market_group_counts": {},
+        "flow_confidence_counts": {},
         "errors": [],
     }
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox"],
         )
@@ -826,11 +955,16 @@ async def scrape():
             timeout=90000,
         )
 
-        if response and response.status >= 400:
-            await browser.close()
-            raise RuntimeError(
-                f"OddsPortal HTTP {response.status}"
-            )
+        if response:
+            debug["http_status"] = response.status
+
+            if response.status >= 400:
+                await browser.close()
+                raise RuntimeError(
+                    f"OddsPortal HTTP {response.status}"
+                )
+
+        debug["final_url"] = page.url
 
         try:
             await page.wait_for_load_state(
@@ -845,101 +979,118 @@ async def scrape():
         await page.wait_for_timeout(PAGE_WAIT_MS)
 
         seen_records = set()
+        seen_pages = set()
 
-        for page_no in range(MAX_PAGES):
+        for page_number in range(MAX_PAGES):
+            if page.url in seen_pages:
+                break
+
+            seen_pages.add(page.url)
+
             debug["pages_scanned"] += 1
 
             cards = await extract_cards(page)
 
             logging.info(
                 "Page %s: %s market cards",
-                page_no + 1,
+                page_number + 1,
                 len(cards),
             )
 
             debug["cards_found"] += len(cards)
 
-            for card in cards:
-                try:
-                    row = parse_card(card)
+            for card_number, card in enumerate(cards, start=1):
+                debug_cards.append({
+                    "page": page_number + 1,
+                    "card": card_number,
+                    "url": card.get("url", ""),
+                    "teams": card.get("teams", ""),
+                    "country": card.get("country", ""),
+                    "league": card.get("league", ""),
+                    "text": card.get("text", ""),
+                })
 
-                    if not row:
+                try:
+                    row, error = parse_card(card)
+
+                    if row is None:
                         debug["parse_failures"] += 1
 
                         failures.append({
-                            "page": page_no + 1,
+                            "page": page_number + 1,
+                            "card": card_number,
                             "teams": card.get("teams", ""),
-                            "reason": "odds_or_teams_not_parsed",
+                            "reason": error,
                         })
-
-                        if len(html_samples) < 5:
-                            html_samples.append(
-                                card.get("text", "")
-                            )
 
                         continue
 
-                    key = row["record_key"]
+                    record_key = row["record_key"]
 
-                    if key in seen_records:
+                    if record_key in seen_records:
                         debug["duplicate_records"] += 1
                         continue
 
-                    seen_records.add(key)
+                    seen_records.add(record_key)
                     rows.append(row)
 
                 except Exception as exc:
                     debug["parse_failures"] += 1
 
                     failures.append({
-                        "page": page_no + 1,
+                        "page": page_number + 1,
+                        "card": card_number,
                         "teams": card.get("teams", ""),
                         "reason": str(exc),
                     })
 
-            if page_no + 1 >= MAX_PAGES:
+                    logging.exception(
+                        "Card parsing failed"
+                    )
+
+            if not ENABLE_PAGINATION:
                 break
 
-            next_button = page.get_by_role(
-                "button",
-                name=re.compile(r"^Next$", re.I),
-            )
-
-            if (
-                await next_button.count() == 0
-                or not await next_button.first.is_enabled()
-            ):
+            if page_number + 1 >= MAX_PAGES:
                 break
 
-            await next_button.first.click()
-            await page.wait_for_timeout(3000)
+            moved = await click_next_page(page)
+
+            if not moved:
+                break
 
         await browser.close()
 
     debug["parsed_rows"] = len(rows)
     debug["qualifying_rows"] = sum(
-        1 for row in rows if row["qualifies"]
+        1 for row in rows
+        if row["qualifies"]
     )
 
-    debug["parse_failure_samples"] = failures[:20]
-    debug["market_group_counts"] = {}
+    debug["parse_failure_samples"] = failures[:50]
 
     for row in rows:
         group = row["market_group"]
+
         debug["market_group_counts"][group] = (
             debug["market_group_counts"].get(group, 0) + 1
         )
 
-    debug["flow_confidence_counts"] = {}
-
-    for row in rows:
         confidence = row["flow_confidence"]
+
         debug["flow_confidence_counts"][confidence] = (
-            debug["flow_confidence_counts"].get(confidence, 0) + 1
+            debug["flow_confidence_counts"].get(
+                confidence,
+                0
+            ) + 1
         )
 
-    HTML_DEBUG_FILE.write_text(
-        "\n\n--- CARD ---\n\n".join(html_samples),
+    CARDS_DEBUG_FILE.write_text(
+        json.dumps(
+            debug_cards,
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -952,12 +1103,17 @@ async def scrape():
 
 def build_signals(rows):
     """
-    NORMAL: one qualifying market group.
-    HIGH: two qualifying market groups.
-    TOP: all three groups:
-          1X2 + negative_handicap + total.
+    NORMAL:
+      One qualifying group.
 
-    Positive handicap never counts as negative handicap.
+    HIGH:
+      Two qualifying groups.
+
+    TOP:
+      All three:
+      1X2 + negative_handicap + total.
+
+    Positive handicap does not count as negative handicap.
     """
 
     grouped = {}
@@ -968,18 +1124,19 @@ def build_signals(rows):
 
         match_key = row["match_key"]
 
-        grouped.setdefault(match_key, {
-            "match_key": match_key,
-            "teams": row["teams"],
-            "home_team": row["home_team"],
-            "away_team": row["away_team"],
-            "league": row["league"],
-            "country": row["country"],
-            "match_time": row["match_time"],
-            "match_url": row["match_url"],
-            "groups": set(),
-            "rows": [],
-        })
+        if match_key not in grouped:
+            grouped[match_key] = {
+                "match_key": match_key,
+                "teams": row["teams"],
+                "home_team": row["home_team"],
+                "away_team": row["away_team"],
+                "country": row["country"],
+                "league": row["league"],
+                "match_time": row["match_time"],
+                "match_url": row["match_url"],
+                "groups": set(),
+                "rows": [],
+            }
 
         grouped[match_key]["groups"].add(
             row["market_group"]
@@ -987,29 +1144,27 @@ def build_signals(rows):
 
         grouped[match_key]["rows"].append(row)
 
-    signals = []
-
     target_groups = {
         "1X2",
         "negative_handicap",
         "total",
     }
 
-    for item in grouped.values():
-        groups = item["groups"]
+    signals = []
 
-        relevant_groups = groups.intersection(
-            target_groups
+    for item in grouped.values():
+        relevant_groups = (
+            item["groups"] & target_groups
         )
 
-        count = len(relevant_groups)
+        group_count = len(relevant_groups)
 
-        if count == 0:
+        if group_count == 0:
             continue
 
-        if target_groups.issubset(groups):
+        if target_groups.issubset(item["groups"]):
             priority = "TOP"
-        elif count == 2:
+        elif group_count == 2:
             priority = "HIGH"
         else:
             priority = "NORMAL"
@@ -1017,11 +1172,11 @@ def build_signals(rows):
         flow_targets = sorted(set(
             row["flow_to_team"]
             for row in item["rows"]
-            if row["flow_to_team"]
+            if row["flow_to_team"] != "Не визначено"
         ))
 
         signals.append({
-            "scraped_at": now_utc(),
+            "scraped_at": utc_now(),
             "priority": priority,
             "teams": item["teams"],
             "home_team": item["home_team"],
@@ -1032,13 +1187,15 @@ def build_signals(rows):
             "qualifying_groups": ",".join(
                 sorted(relevant_groups)
             ),
-            "qualifying_group_count": count,
+            "qualifying_group_count": group_count,
             "flow_targets": " | ".join(flow_targets),
             "qualifying_markets": " | ".join(
-                row["market"] for row in item["rows"]
+                row["market"]
+                for row in item["rows"]
             ),
             "qualifying_selections": " | ".join(
-                row["selection"] for row in item["rows"]
+                row["selection"]
+                for row in item["rows"]
             ),
             "match_url": item["match_url"],
             "match_key": item["match_key"],
@@ -1058,10 +1215,16 @@ def build_signals(rows):
 
 
 # ============================================================
-# SQLITE
+# SQLITE DATABASE AND SAFE MIGRATION
 # ============================================================
 
 def init_db():
+    """
+    Create the table if needed.
+    Add missing columns to an existing database.
+    Never delete existing records.
+    """
+
     connection = sqlite3.connect(DB_FILE)
 
     connection.execute("""
@@ -1076,6 +1239,7 @@ def init_db():
             selection_code TEXT,
             flow_to_team TEXT,
             flow_direction TEXT,
+            flow_confidence TEXT,
             odds_old REAL,
             odds_new REAL,
             best_current_odds REAL,
@@ -1086,7 +1250,51 @@ def init_db():
         )
     """)
 
+    required_columns = {
+        "record_key": "TEXT",
+        "scraped_at": "TEXT",
+        "match_key": "TEXT",
+        "teams": "TEXT",
+        "market_code": "TEXT",
+        "market_group": "TEXT",
+        "selection": "TEXT",
+        "selection_code": "TEXT",
+        "flow_to_team": "TEXT",
+        "flow_direction": "TEXT",
+        "flow_confidence": "TEXT",
+        "odds_old": "REAL",
+        "odds_new": "REAL",
+        "best_current_odds": "REAL",
+        "drop_pct": "REAL",
+        "calculated_drop_pct": "REAL",
+        "qualifies": "INTEGER",
+        "raw_json": "TEXT",
+    }
+
+    existing_columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(odds_history)"
+        ).fetchall()
+    }
+
+    added_columns = []
+
+    for column, column_type in required_columns.items():
+        if column not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE odds_history "
+                f"ADD COLUMN {column} {column_type}"
+            )
+            added_columns.append(column)
+
     connection.commit()
+
+    logging.info(
+        "SQLite schema checked. Added columns: %s",
+        added_columns if added_columns else "none"
+    )
+
     connection.close()
 
 
@@ -1110,6 +1318,7 @@ def save_database(rows):
                 selection_code,
                 flow_to_team,
                 flow_direction,
+                flow_confidence,
                 odds_old,
                 odds_new,
                 best_current_odds,
@@ -1118,7 +1327,10 @@ def save_database(rows):
                 qualifies,
                 raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
         """, (
             row["record_key"],
             row["scraped_at"],
@@ -1130,13 +1342,17 @@ def save_database(rows):
             row["selection_code"],
             row["flow_to_team"],
             row["flow_direction"],
+            row["flow_confidence"],
             row["odds_old"],
             row["odds_new"],
             row["best_current_odds"],
             row["drop_pct"],
             row["calculated_drop_pct"],
             int(row["qualifies"]),
-            json.dumps(row, ensure_ascii=False),
+            json.dumps(
+                row,
+                ensure_ascii=False
+            ),
         ))
 
         inserted += cursor.rowcount
@@ -1168,6 +1384,14 @@ def write_csv(path, rows, fields):
 
 
 def append_history(rows):
+    """
+    Append only unseen record_key values.
+    Old history columns are preserved.
+    New columns are added to the CSV header when the file
+    is rewritten through a temporary file.
+    """
+
+    existing_rows = []
     existing_keys = set()
 
     if HISTORY_FILE.exists():
@@ -1179,14 +1403,17 @@ def append_history(rows):
             ) as file:
                 reader = csv.DictReader(file)
 
-                for row in reader:
-                    key = row.get("record_key")
+                for old_row in reader:
+                    existing_rows.append(old_row)
+
+                    key = old_row.get("record_key")
+
                     if key:
                         existing_keys.add(key)
 
         except Exception as exc:
             logging.warning(
-                "Could not read history CSV: %s",
+                "Could not read existing history CSV: %s",
                 exc,
             )
 
@@ -1195,26 +1422,29 @@ def append_history(rows):
         if row["record_key"] not in existing_keys
     ]
 
-    if not new_rows:
+    if not new_rows and not existing_rows:
         return 0
 
-    file_exists = HISTORY_FILE.exists()
+    if new_rows:
+        merged_rows = existing_rows + new_rows
 
-    with HISTORY_FILE.open(
-        "a",
-        newline="",
-        encoding="utf-8-sig",
-    ) as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=FIELDS,
-            extrasaction="ignore",
-        )
+        temp_file = HISTORY_FILE.with_suffix(".tmp")
 
-        if not file_exists:
+        with temp_file.open(
+            "w",
+            newline="",
+            encoding="utf-8-sig",
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=FIELDS,
+                extrasaction="ignore",
+            )
+
             writer.writeheader()
+            writer.writerows(merged_rows)
 
-        writer.writerows(new_rows)
+        temp_file.replace(HISTORY_FILE)
 
     return len(new_rows)
 
@@ -1230,46 +1460,39 @@ async def main():
 
     if not rows:
         debug["result"] = "no_rows"
+        debug["finished_at"] = utc_now()
+
         DEBUG_FILE.write_text(
-            json.dumps(debug, ensure_ascii=False, indent=2),
+            json.dumps(
+                debug,
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
         raise RuntimeError(
-            "No rows parsed. Check OddsPortal page structure "
-            "and data/oddsportal_cards_debug.html"
+            "No valid rows parsed. "
+            "Check data/oddsportal_cards_debug.json"
         )
 
     signals = build_signals(rows)
 
+    # Current snapshot.
     write_csv(
         LATEST_FILE,
         rows,
         FIELDS,
     )
 
+    # Signals.
     write_csv(
         SIGNALS_FILE,
         signals,
-        list(signals[0].keys()) if signals else [
-            "scraped_at",
-            "priority",
-            "teams",
-            "home_team",
-            "away_team",
-            "country",
-            "league",
-            "match_time",
-            "qualifying_groups",
-            "qualifying_group_count",
-            "flow_targets",
-            "qualifying_markets",
-            "qualifying_selections",
-            "match_url",
-            "match_key",
-        ],
+        SIGNAL_FIELDS,
     )
 
+    # Historical CSV and SQLite.
     history_added = append_history(rows)
     database_added = save_database(rows)
 
@@ -1286,34 +1509,51 @@ async def main():
         "signals": len(signals),
         "signal_priorities": {
             "TOP": sum(
-                1 for s in signals
-                if s["priority"] == "TOP"
+                1 for signal in signals
+                if signal["priority"] == "TOP"
             ),
             "HIGH": sum(
-                1 for s in signals
-                if s["priority"] == "HIGH"
+                1 for signal in signals
+                if signal["priority"] == "HIGH"
             ),
             "NORMAL": sum(
-                1 for s in signals
-                if s["priority"] == "NORMAL"
+                1 for signal in signals
+                if signal["priority"] == "NORMAL"
             ),
         },
         "result": "completed",
     })
 
     DEBUG_FILE.write_text(
-        json.dumps(debug, ensure_ascii=False, indent=2),
+        json.dumps(
+            debug,
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
-    logging.info("====================================")
+    logging.info("------------------------------------")
     logging.info("OddsPortal parser completed")
-    logging.info("Rows: %s", len(rows))
-    logging.info("Qualifying rows: %s", debug["qualifying_rows"])
-    logging.info("Signals: %s", len(signals))
+    logging.info("Pages scanned: %s", debug["pages_scanned"])
+    logging.info("Cards found: %s", debug["cards_found"])
+    logging.info("Rows parsed: %s", debug["parsed_rows"])
+    logging.info(
+        "Qualifying rows: %s",
+        debug["qualifying_rows"]
+    )
+    logging.info("Signals: %s", debug["signals"])
     logging.info("History added: %s", history_added)
     logging.info("Database added: %s", database_added)
-    logging.info("====================================")
+    logging.info(
+        "Market groups: %s",
+        debug["market_group_counts"]
+    )
+    logging.info(
+        "Flow confidence: %s",
+        debug["flow_confidence_counts"]
+    )
+    logging.info("------------------------------------")
 
 
 if __name__ == "__main__":
