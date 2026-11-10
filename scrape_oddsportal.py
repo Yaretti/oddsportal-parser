@@ -2,582 +2,1031 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+OddsPortal Dropping Odds parser.
+
+Reads:
+- match
+- league
+- market and selection
+- drop percentage
+- old odds
+- new odds
+- best current odds
+
+Signals:
+A) old odds 4.00-5.00 -> new odds <= 2.00
+B) old odds 2.00-3.00 -> new odds <= 1.80
+
+Priority by qualifying market groups:
+1 group  = NORMAL
+2 groups = HIGH
+3 groups = TOP
+
+TOP requires:
+1X2 + negative handicap + total goals.
+
+Important:
+Odds movement is not proof of money flow or betting volume.
+"""
+
+import os
 import re
 import csv
 import json
 import time
-import hashlib
 import sqlite3
-import logging
-
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urlparse, unquote
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
-# ==================================================
+# ---------------------------------------------------------
 # CONFIG
-# ==================================================
+# ---------------------------------------------------------
 
-URL = "https://www.oddsportal.com/dropping-odds/"
-DATA = Path("data")
-DATA.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DEBUG_DIR = DATA_DIR / "debug"
 
-LATEST = DATA / "oddsportal_latest.csv"
-SIGNALS = DATA / "oddsportal_signals.csv"
-DEBUG = DATA / "oddsportal_debug.json"
-DATABASE = DATA / "oddsportal_history.sqlite"
+DATA_DIR.mkdir(exist_ok=True)
+DEBUG_DIR.mkdir(exist_ok=True)
 
-PAGE_TIMEOUT = 30000
-TOTAL_TIMEOUT = 110
-MAX_ROWS = 500
+URL = os.getenv(
+    "ODDSPORTAL_URL",
+    "https://www.oddsportal.com/dropping-odds/2/2/0/overall/"
+)
 
-FIELDS = [
+HEADLESS = True
+TIMEOUT = 60000
+
+LATEST_CSV = DATA_DIR / "oddsportal_latest.csv"
+HISTORY_CSV = DATA_DIR / "oddsportal_history.csv"
+SIGNALS_CSV = DATA_DIR / "oddsportal_signals.csv"
+DATABASE = DATA_DIR / "oddsportal_history.sqlite"
+DEBUG_JSON = DATA_DIR / "oddsportal_debug.json"
+
+CSV_FIELDS = [
     "scraped_at",
-    "match",
+    "sport",
     "league",
+    "country",
+    "home_team",
+    "away_team",
+    "teams",
+    "match_time",
     "market",
+    "market_group",
     "selection",
     "handicap_line",
     "drop_pct",
     "odds_old",
     "odds_new",
     "best_current_odds",
+    "qualifies",
+    "criterion",
     "match_url",
-    "priority",
-    "markets_count",
+    "market_url",
 ]
 
-started = time.monotonic()
+SIGNAL_FIELDS = [
+    "scraped_at",
+    "sport",
+    "league",
+    "teams",
+    "match_time",
+    "priority",
+    "qualifying_markets",
+    "market_count",
+    "has_1x2",
+    "has_negative_handicap",
+    "has_total",
+    "all_three_markets",
+    "details",
+    "match_url",
+]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
 
-log = logging.getLogger("oddsportal")
-
-
-# ==================================================
+# ---------------------------------------------------------
 # HELPERS
-# ==================================================
+# ---------------------------------------------------------
 
-def now():
+def now_utc():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def check_timeout():
-    if time.monotonic() - started > TOTAL_TIMEOUT:
-        raise TimeoutError("Total parser timeout")
+def clean_text(value):
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def clean(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+def parse_number(value):
+    if value is None:
+        return None
 
+    value = str(value).strip().replace(",", ".")
 
-def number(value):
     try:
-        return float(str(value).replace(",", "."))
+        number = float(value)
+        if number <= 0 or number > 10000:
+            return None
+        return number
     except (ValueError, TypeError):
         return None
 
 
-def make_id(value):
-    return hashlib.sha1(value.encode()).hexdigest()[:16]
-
-
-# ==================================================
-# USER CRITERIA
-# ==================================================
-
-def qualifies(old, new):
-    if old is None or new is None or new >= old:
-        return False
-
-    # 4.00–5.00 -> 2.00 or lower
-    if 4.00 <= old <= 5.00 and new <= 2.00:
-        return True
-
-    # 2.00–3.00 -> 1.80 or lower
-    if 2.00 <= old <= 3.00 and new <= 1.80:
-        return True
-
-    return False
-
-
-# ==================================================
-# MARKET DETECTION
-# ==================================================
-
-def classify_market(line):
-    value = clean(line).upper()
-
-    # Only full-time 1X2, not HT/FT or half-time markets
-    if value in ("1X2", "1X2 FT", "1X2 FT ONLY"):
-        return "1X2"
-
-    # Totals
-    if value.startswith("O/U") or "OVER/UNDER" in value:
-        return "TOTAL"
-
-    # Handicap
-    if value.startswith("AH") or value.startswith("EH"):
-        return "HANDICAP"
-
-    return None
-
-
-def get_handicap_line(line):
-    match = re.search(r"(?:AH|EH)\s*([+-]\s*\d+(?:\.\d+)?)", line, re.I)
-
-    if not match:
-        return ""
-
-    return match.group(1).replace(" ", "")
-
-
-def is_negative_handicap(line):
-    value = get_handicap_line(line)
-    return value.startswith("-")
-
-
-# ==================================================
-# PARSE CARD
-# ==================================================
-
-def parse_card(card):
-    lines = [
-        clean(x)
-        for x in card.get("text", "").splitlines()
-        if clean(x)
-    ]
-
-    if not lines:
-        return None
-
-    # Find market label
-    market_index = None
-    market = None
-    market_label = ""
-
-    for i, line in enumerate(lines):
-        detected = classify_market(line)
-
-        if detected:
-            market_index = i
-            market = detected
-            market_label = line
-            break
-
-    if market_index is None:
-        return None
-
-    # For the priority combination, only negative handicaps count
-    handicap_line = ""
-
-    if market == "HANDICAP":
-        handicap_line = get_handicap_line(market_label)
-
-        if not handicap_line.startswith("-"):
-            return None
-
-    # Find percentage and odds
-    joined = " ".join(lines)
-
-    pattern = re.search(
-        r"(-\d{1,3})\s*%\s*"
-        r"(\d{1,3}(?:[.,]\d{1,3})?)\s+"
-        r"(\d{1,3}(?:[.,]\d{1,3})?)\s+"
-        r"(\d{1,3}(?:[.,]\d{1,3})?)",
-        joined
-    )
-
-    if not pattern:
-        return None
-
-    drop_pct = abs(float(pattern.group(1)))
-    old = number(pattern.group(2))
-    new = number(pattern.group(3))
-    best = number(pattern.group(4))
-
-    if not qualifies(old, new):
-        return None
-
-    # Selection usually follows market label
-    selection = ""
-
-    if market_index + 1 < len(lines):
-        selection = lines[market_index + 1]
-
-    # Competition: last breadcrumb before market label
-    league = ""
-
-    for line in reversed(lines[:market_index]):
-        if line.lower() not in ("football", "/", "world"):
-            league = line
-            break
-
-    # Extract teams from lines after "Best Current Odds"
-    match_name = ""
-    best_index = None
-
-    for i, line in enumerate(lines):
-        if "best current odds" in line.lower():
-            best_index = i
-            break
-
-    if best_index is not None:
-        tail = lines[best_index + 1:]
-
-        # Remove date and time lines
-        tail = [
-            x for x in tail
-            if not re.fullmatch(
-                r"(today|tomorrow|\d{1,2}\s+\w+|\d{1,2}:\d{2})",
-                x,
-                re.I
-            )
-        ]
-
-        if "-" in tail:
-            dash = tail.index("-")
-
-            if dash > 0 and dash + 1 < len(tail):
-                home = tail[dash - 1]
-                away = tail[dash + 1]
-                match_name = f"{home} - {away}"
-
-    if not match_name:
-        match_name = clean(card.get("anchor_text")) or "Unknown match"
-
-    return {
-        "scraped_at": now(),
-        "match": match_name,
-        "league": league,
-        "market": market,
-        "selection": selection,
-        "handicap_line": handicap_line,
-        "drop_pct": drop_pct,
-        "odds_old": old,
-        "odds_new": new,
-        "best_current_odds": best,
-        "match_url": card.get("url", ""),
-        "priority": "",
-        "markets_count": 0,
-    }
-
-
-# ==================================================
-# EXTRACT CARDS DIRECTLY FROM DROPPING ODDS PAGE
-# ==================================================
-
-def extract_cards(page):
-    log.info("Extracting dropping odds cards from main page...")
-
-    cards = page.evaluate("""
-    () => {
-        const anchors = Array.from(document.querySelectorAll('a[href]'));
-        const result = [];
-        const seen = new Set();
-
-        for (const a of anchors) {
-            const href = a.href || '';
-
-            if (
-                !href.includes('/football/h2h/') &&
-                !href.includes('/match/')
-            ) {
-                continue;
-            }
-
-            let node = a;
-            let best = null;
-
-            // Find the smallest ancestor containing the full odds card
-            for (let depth = 0; depth < 10 && node; depth++) {
-                const text = (node.innerText || '').trim();
-
-                const hasPercent = /-\\d{1,3}\\s*%/.test(text);
-                const hasBest = /Best Current Odds/i.test(text);
-                const hasMarket = /1X2|O\\/U|AH\\s*[+-]|EH\\s*[+-]|DNB|HT\\/FT/i.test(text);
-
-                if (
-                    hasPercent &&
-                    hasBest &&
-                    hasMarket &&
-                    text.length < 5000
-                ) {
-                    best = {
-                        url: href,
-                        anchor_text: (a.innerText || a.textContent || '').trim(),
-                        text: text
-                    };
-                    break;
-                }
-
-                node = node.parentElement;
-            }
-
-            if (!best) continue;
-
-            const key = best.text;
-
-            if (seen.has(key)) continue;
-
-            seen.add(key);
-            result.push(best);
-        }
-
-        return result;
-    }
-    """)
-
-    log.info("Cards extracted: %s", len(cards))
-
-    return cards[:MAX_ROWS]
-
-
-# ==================================================
-# SIGNAL GROUPING
-# ==================================================
-
-def group_signals(rows):
-    groups = {}
-
-    for row in rows:
-        key = make_id(row["match"] + "|" + row["league"])
-
-        if key not in groups:
-            groups[key] = []
-
-        groups[key].append(row)
+def extract_odds(text):
+    """
+    Extract decimal odds from text.
+    Only values with a decimal point are accepted.
+    """
+
+    found = re.findall(r"(?<![\d.])\d{1,4}\.\d{1,3}(?!\d)", text or "")
 
     result = []
-
-    for match_rows in groups.values():
-        markets = set(row["market"] for row in match_rows)
-
-        count = len(markets)
-
-        if count >= 3:
-            priority = "TOP"
-        elif count == 2:
-            priority = "HIGH"
-        else:
-            priority = "NORMAL"
-
-        for row in match_rows:
-            row["markets_count"] = count
-            row["priority"] = priority
-            result.append(row)
+    for item in found:
+        number = parse_number(item)
+        if number is not None:
+            result.append(number)
 
     return result
 
 
-# ==================================================
-# DATABASE
-# ==================================================
+def write_csv(path, rows, fields, append=False):
+    if not rows:
+        return
 
-def init_db():
-    with sqlite3.connect(DATABASE) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS odds_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scraped_at TEXT,
-                match TEXT,
-                league TEXT,
-                market TEXT,
-                selection TEXT,
-                odds_old REAL,
-                odds_new REAL,
-                best_current_odds REAL,
-                drop_pct REAL,
-                match_url TEXT,
-                UNIQUE(match, league, market, selection,
-                       odds_old, odds_new)
-            )
-        """)
+    mode = "a" if append else "w"
+    file_exists = path.exists() and path.stat().st_size > 0
 
-
-def save_db(rows):
-    inserted = 0
-
-    with sqlite3.connect(DATABASE) as conn:
-        for row in rows:
-            before = conn.total_changes
-
-            conn.execute("""
-                INSERT OR IGNORE INTO odds_history (
-                    scraped_at, match, league, market,
-                    selection, odds_old, odds_new,
-                    best_current_odds, drop_pct, match_url
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                row["scraped_at"],
-                row["match"],
-                row["league"],
-                row["market"],
-                row["selection"],
-                row["odds_old"],
-                row["odds_new"],
-                row["best_current_odds"],
-                row["drop_pct"],
-                row["match_url"],
-            ))
-
-            if conn.total_changes > before:
-                inserted += 1
-
-    return inserted
-
-
-# ==================================================
-# CSV
-# ==================================================
-
-def write_csv(path, rows):
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+    with open(path, mode, newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=FIELDS,
+            fieldnames=fields,
             extrasaction="ignore"
         )
-        writer.writeheader()
+
+        if not append or not file_exists:
+            writer.writeheader()
+
         writer.writerows(rows)
 
 
-# ==================================================
-# MAIN
-# ==================================================
+def safe_filename(value):
+    value = re.sub(r"[^a-zA-Z0-9_-]+", "_", value)
+    return value[:100]
 
-def main():
-    log.info("ODDSPORTAL PARSER START")
-    log.info("URL: %s", URL)
+
+# ---------------------------------------------------------
+# MARKET PARSING
+# ---------------------------------------------------------
+
+def get_market_fragment(url):
+    """
+    Example fragments:
+    #abc:1X2;2
+    #abc:over-under;2;6.50;0
+    #abc:ah;2;0.75;0
+    #abc:eh;2;-1.00;0
+    """
+
+    if "#" not in url:
+        return []
+
+    fragment = unquote(url.split("#", 1)[1])
+
+    if ":" in fragment:
+        fragment = fragment.split(":", 1)[1]
+
+    return [x.strip() for x in fragment.split(";") if x.strip()]
+
+
+def classify_market(url, card_text):
+    parts = get_market_fragment(url)
+    code = parts[0].lower() if parts else ""
+
+    text = (card_text or "").lower()
+
+    market = "OTHER"
+    group = "other"
+    handicap_line = None
+
+    if code in ("1x2",):
+        market = "1X2"
+        group = "1x2"
+
+    elif code in ("over-under", "total", "totals"):
+        market = "TOTAL"
+        group = "total"
+
+    elif code in ("ah", "asian-handicap", "eh", "european-handicap"):
+        market = "HANDICAP"
+
+        if len(parts) >= 3:
+            handicap_line = parse_number(parts[2])
+
+        if handicap_line is not None and handicap_line < 0:
+            group = "negative_handicap"
+        else:
+            group = "positive_or_zero_handicap"
+
+    elif code == "dnb":
+        market = "DNB"
+        group = "other"
+
+    elif code == "ht-ft":
+        market = "HT/FT"
+        group = "other"
+
+    elif code in ("qualify", "to-qualify"):
+        market = "TO QUALIFY"
+        group = "other"
+
+    else:
+        if "1x2" in text:
+            market = "1X2"
+            group = "1x2"
+        elif "o/u" in text or "over/under" in text:
+            market = "TOTAL"
+            group = "total"
+        elif "asian handicap" in text or re.search(r"\bah\b", text):
+            market = "HANDICAP"
+            group = "other"
+
+    # Market display name from the card.
+    market_line = ""
+
+    for line in (card_text or "").splitlines():
+        line = clean_text(line)
+        if not line:
+            continue
+
+        upper = line.upper()
+
+        if (
+            upper == "1X2"
+            or upper.startswith("O/U")
+            or upper.startswith("AH ")
+            or upper.startswith("EH ")
+            or upper in ("DNB", "HT/FT")
+            or "1ST HALF" in upper
+            or "2ND HALF" in upper
+        ):
+            market_line = line
+            break
+
+    if market_line:
+        market = market_line
+
+    # Handicap line from URL has priority.
+    if group == "negative_handicap" and handicap_line is not None:
+        handicap_line = float(handicap_line)
+
+    return {
+        "market": market,
+        "market_group": group,
+        "handicap_line": handicap_line,
+        "fragment": parts,
+    }
+
+
+def extract_selection(card_text, market_info):
+    lines = [
+        clean_text(x)
+        for x in (card_text or "").splitlines()
+        if clean_text(x)
+    ]
+
+    market = market_info["market"]
+
+    try:
+        index = lines.index(market)
+        if index + 1 < len(lines):
+            candidate = lines[index + 1]
+
+            if candidate.lower() not in (
+                "best current odds",
+                "football",
+                "basketball",
+                "tennis",
+            ):
+                return candidate
+    except ValueError:
+        pass
+
+    # Fallback: URL fragment outcome index.
+    parts = market_info.get("fragment", [])
+
+    if len(parts) >= 2:
+        return parts[1]
+
+    return ""
+
+
+# ---------------------------------------------------------
+# MATCH AND LEAGUE PARSING
+# ---------------------------------------------------------
+
+def extract_match(anchor_text):
+    lines = [
+        clean_text(x)
+        for x in (anchor_text or "").splitlines()
+        if clean_text(x)
+    ]
+
+    ignored = {
+        "-", "–", "—",
+    }
+
+    filtered = []
+
+    for line in lines:
+        if line in ignored:
+            continue
+
+        if re.fullmatch(r"\d{1,2}:\d{2}", line):
+            continue
+
+        if line.lower() in (
+            "today",
+            "tomorrow",
+            "yesterday",
+        ):
+            continue
+
+        if re.fullmatch(r"\d{1,2}\s+[A-Za-z]{3}", line):
+            continue
+
+        filtered.append(line)
+
+    if len(filtered) >= 2:
+        return filtered[-2], filtered[-1]
+
+    # Inline fallback.
+    match = re.search(r"(.+?)\s+[-–—]\s+(.+)", clean_text(anchor_text))
+
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+
+    return "", ""
+
+
+def extract_match_time(anchor_text):
+    text = clean_text(anchor_text)
+
+    date_match = re.search(
+        r"(Today|Tomorrow|Yesterday|\d{1,2}\s+[A-Za-z]{3})",
+        text,
+        re.IGNORECASE
+    )
+
+    time_match = re.search(r"\b\d{1,2}:\d{2}\b", text)
+
+    date_part = date_match.group(1) if date_match else ""
+    time_part = time_match.group(0) if time_match else ""
+
+    return clean_text(f"{date_part} {time_part}")
+
+
+def extract_league(links):
+    """
+    Uses football breadcrumb links inside the match card.
+    """
+
+    candidates = []
+
+    for item in links or []:
+        href = item.get("href", "")
+        label = clean_text(item.get("text", ""))
+
+        if (
+            "/football/" in href
+            and "/h2h/" not in href
+            and label
+            and label.lower() not in ("football", "home")
+        ):
+            candidates.append({
+                "text": label,
+                "href": href,
+            })
+
+    if not candidates:
+        return "", ""
+
+    # The last breadcrumb is normally the competition.
+    league = candidates[-1]["text"]
+
+    country = ""
+    if len(candidates) >= 2:
+        country = candidates[-2]["text"]
+
+    return league, country
+
+
+# ---------------------------------------------------------
+# CRITERIA
+# ---------------------------------------------------------
+
+def check_criteria(old_odds, new_odds):
+    if old_odds is None or new_odds is None:
+        return False, ""
+
+    # Criterion A:
+    # Opening odds 4.00-5.00 -> 2.00 or lower.
+    if 4.00 <= old_odds <= 5.00 and new_odds <= 2.00:
+        return True, "4.00-5.00_to_2.00_or_lower"
+
+    # Criterion B:
+    # Opening odds 2.00-3.00 -> 1.80 or lower.
+    if 2.00 <= old_odds <= 3.00 and new_odds <= 1.80:
+        return True, "2.00-3.00_to_1.80_or_lower"
+
+    return False, ""
+
+
+# ---------------------------------------------------------
+# DATABASE
+# ---------------------------------------------------------
+
+def init_database():
+    conn = sqlite3.connect(DATABASE)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS odds_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_key TEXT UNIQUE,
+            scraped_at TEXT,
+            sport TEXT,
+            league TEXT,
+            country TEXT,
+            home_team TEXT,
+            away_team TEXT,
+            teams TEXT,
+            match_time TEXT,
+            market TEXT,
+            market_group TEXT,
+            selection TEXT,
+            handicap_line REAL,
+            drop_pct REAL,
+            odds_old REAL,
+            odds_new REAL,
+            best_current_odds REAL,
+            qualifies INTEGER,
+            criterion TEXT,
+            match_url TEXT,
+            market_url TEXT
+        )
+    """)
+
+    conn.commit()
+    return conn
+
+
+def save_history(conn, rows):
+    inserted = []
+
+    for row in rows:
+        key_source = "|".join([
+            row.get("match_url", ""),
+            row.get("market", ""),
+            row.get("selection", ""),
+            str(row.get("odds_old", "")),
+            str(row.get("odds_new", "")),
+            str(row.get("drop_pct", "")),
+        ])
+
+        record_key = hashlib.sha256(
+            key_source.encode("utf-8")
+        ).hexdigest()
+
+        values = (
+            record_key,
+            row.get("scraped_at"),
+            row.get("sport"),
+            row.get("league"),
+            row.get("country"),
+            row.get("home_team"),
+            row.get("away_team"),
+            row.get("teams"),
+            row.get("match_time"),
+            row.get("market"),
+            row.get("market_group"),
+            row.get("selection"),
+            row.get("handicap_line"),
+            row.get("drop_pct"),
+            row.get("odds_old"),
+            row.get("odds_new"),
+            row.get("best_current_odds"),
+            int(bool(row.get("qualifies"))),
+            row.get("criterion"),
+            row.get("match_url"),
+            row.get("market_url"),
+        )
+
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO odds_history (
+                record_key, scraped_at, sport, league, country,
+                home_team, away_team, teams, match_time,
+                market, market_group, selection, handicap_line,
+                drop_pct, odds_old, odds_new, best_current_odds,
+                qualifies, criterion, match_url, market_url
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, values)
+
+        if cursor.rowcount > 0:
+            inserted.append(row)
+
+    conn.commit()
+    return inserted
+
+
+# ---------------------------------------------------------
+# HTML CARD EXTRACTION
+# ---------------------------------------------------------
+
+def collect_cards(page):
+    """
+    Finds match anchors and collects their ancestor elements.
+
+    This avoids the previous bug where an absolute URL was
+    incorrectly used to locate a relative href in the DOM.
+    """
+
+    return page.locator(
+        'a[href*="/football/h2h/"]'
+    ).evaluate_all("""
+        anchors => anchors.map(anchor => {
+            const ancestors = [];
+            let node = anchor;
+
+            for (let depth = 0; depth < 9 && node; depth++) {
+                node = node.parentElement;
+                if (!node) break;
+
+                const links = Array.from(node.querySelectorAll("a"))
+                    .map(a => ({
+                        text: (a.innerText || a.textContent || "").trim(),
+                        href: a.href || ""
+                    }));
+
+                ancestors.push({
+                    depth: depth + 1,
+                    text: node.innerText || node.textContent || "",
+                    html: node.outerHTML || "",
+                    links: links
+                });
+            }
+
+            return {
+                href: anchor.href || "",
+                text: anchor.innerText || anchor.textContent || "",
+                ancestors: ancestors
+            };
+        })
+    """)
+
+
+def choose_card(item):
+    """
+    Selects the smallest ancestor that contains:
+    - the match anchor
+    - a drop percentage
+    - at least three decimal odds
+    - Best Current Odds label
+    """
+
+    candidates = []
+
+    for ancestor in item.get("ancestors", []):
+        text = ancestor.get("text", "")
+        flat = clean_text(text)
+
+        has_drop = bool(re.search(r"-\s*\d{1,3}\s*%", flat))
+        has_best = "Best Current Odds" in flat
+        odds = extract_odds(flat)
+
+        if has_drop and has_best and len(odds) >= 3:
+            candidates.append(ancestor)
+
+    if candidates:
+        return min(
+            candidates,
+            key=lambda x: len(x.get("text", ""))
+        )
+
+    # Fallback: use the ancestor with the most useful information.
+    for ancestor in item.get("ancestors", []):
+        text = ancestor.get("text", "")
+        if (
+            re.search(r"-\s*\d{1,3}\s*%", text)
+            and len(extract_odds(text)) >= 3
+        ):
+            return ancestor
+
+    return None
+
+
+def parse_card(item, scraped_at):
+    match_url = item.get("href", "")
+    anchor_text = item.get("text", "")
+
+    card = choose_card(item)
+
+    if not card:
+        return None, {
+            "url": match_url,
+            "reason": "No suitable ancestor found",
+            "anchor_text": anchor_text,
+        }
+
+    card_text = card.get("text", "")
+    flat = clean_text(card_text)
+
+    # The page presents:
+    # drop percentage, old odds, new odds, best current odds.
+    drop_match = re.search(
+        r"-\s*(\d{1,3}(?:\.\d+)?)\s*%",
+        flat
+    )
+
+    odds = extract_odds(flat)
+
+    if not drop_match or len(odds) < 3:
+        return None, {
+            "url": match_url,
+            "reason": "Could not extract drop and three odds",
+            "text": flat[:3000],
+            "odds_found": odds,
+        }
+
+    drop_pct = float(drop_match.group(1))
+
+    odds_old = odds[0]
+    odds_new = odds[1]
+    best_current_odds = odds[2]
+
+    home, away = extract_match(anchor_text)
+    match_time = extract_match_time(anchor_text)
+
+    league, country = extract_league(
+        card.get("links", [])
+    )
+
+    market_info = classify_market(
+        match_url,
+        card_text
+    )
+
+    selection = extract_selection(
+        card_text,
+        market_info
+    )
+
+    qualifies, criterion = check_criteria(
+        odds_old,
+        odds_new
+    )
+
+    # This parser is for football only.
+    # Non-football rows are not collected because the selector
+    # specifically targets /football/h2h/ URLs.
+
+    row = {
+        "scraped_at": scraped_at,
+        "sport": "Football",
+        "league": league,
+        "country": country,
+        "home_team": home,
+        "away_team": away,
+        "teams": f"{home} - {away}".strip(" -"),
+        "match_time": match_time,
+        "market": market_info["market"],
+        "market_group": market_info["market_group"],
+        "selection": selection,
+        "handicap_line": market_info["handicap_line"],
+        "drop_pct": drop_pct,
+        "odds_old": odds_old,
+        "odds_new": odds_new,
+        "best_current_odds": best_current_odds,
+        "qualifies": qualifies,
+        "criterion": criterion,
+        "match_url": match_url.split("#")[0],
+        "market_url": match_url,
+    }
 
     debug = {
-        "started_at": now(),
+        "url": match_url,
+        "anchor_text": anchor_text,
+        "selected_card_text": card_text[:5000],
+        "selected_card_html": card.get("html", "")[:50000],
+        "odds_found": odds,
+        "drop_pct": drop_pct,
+        "parsed": row,
+    }
+
+    return row, debug
+
+
+# ---------------------------------------------------------
+# SIGNAL GROUPING
+# ---------------------------------------------------------
+
+def build_signals(rows):
+    grouped = {}
+
+    for row in rows:
+        if not row.get("qualifies"):
+            continue
+
+        match_key = row.get("match_url", "")
+
+        if not match_key:
+            continue
+
+        grouped.setdefault(match_key, []).append(row)
+
+    signals = []
+
+    for match_url, match_rows in grouped.items():
+        groups = {
+            row.get("market_group")
+            for row in match_rows
+        }
+
+        has_1x2 = "1x2" in groups
+        has_handicap = "negative_handicap" in groups
+        has_total = "total" in groups
+
+        core_groups = sum([
+            has_1x2,
+            has_handicap,
+            has_total,
+        ])
+
+        # Count unique qualifying market groups.
+        market_count = len(groups)
+
+        if core_groups == 3:
+            priority = "TOP"
+        elif market_count >= 2:
+            priority = "HIGH"
+        else:
+            priority = "NORMAL"
+
+        first = match_rows[0]
+
+        details = []
+
+        for row in match_rows:
+            details.append(
+                f"{row['market']} / {row['selection']}: "
+                f"{row['odds_old']} -> {row['odds_new']} "
+                f"({row['drop_pct']}%)"
+            )
+
+        signals.append({
+            "scraped_at": first["scraped_at"],
+            "sport": first["sport"],
+            "league": first["league"],
+            "teams": first["teams"],
+            "match_time": first["match_time"],
+            "priority": priority,
+            "qualifying_markets": ", ".join(sorted(groups)),
+            "market_count": market_count,
+            "has_1x2": has_1x2,
+            "has_negative_handicap": has_handicap,
+            "has_total": has_total,
+            "all_three_markets": core_groups == 3,
+            "details": " | ".join(details),
+            "match_url": match_url,
+        })
+
+    priority_order = {
+        "TOP": 0,
+        "HIGH": 1,
+        "NORMAL": 2,
+    }
+
+    signals.sort(
+        key=lambda x: (
+            priority_order.get(x["priority"], 9),
+            x["league"],
+            x["teams"],
+        )
+    )
+
+    return signals
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+def main():
+    started = time.time()
+    scraped_at = now_utc()
+
+    debug = {
+        "started_at": scraped_at,
         "url": URL,
         "cards_found": 0,
+        "parsed_rows": 0,
         "qualifying_rows": 0,
         "signals": 0,
         "errors": [],
+        "card_debug": [],
     }
-
-    init_db()
 
     rows = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            headless=HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ]
         )
 
-        page = browser.new_page(
-            viewport={"width": 1440, "height": 1000},
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1100},
             locale="en-US",
+            timezone_id="Europe/Kyiv",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
         )
 
-        page.set_default_timeout(PAGE_TIMEOUT)
+        page = context.new_page()
+        page.set_default_timeout(TIMEOUT)
 
         try:
-            log.info("Opening dropping odds page...")
-
             response = page.goto(
                 URL,
                 wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT
+                timeout=TIMEOUT
             )
 
-            debug["http_status"] = response.status if response else None
+            debug["http_status"] = (
+                response.status if response else None
+            )
 
-            log.info("HTTP status: %s", debug["http_status"])
-
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(4000)
 
             debug["page_title"] = page.title()
             debug["final_url"] = page.url
 
-            cards = extract_cards(page)
+            # Save the full page HTML for future inspection.
+            full_html = page.content()
+
+            (DEBUG_DIR / "oddsportal_page.html").write_text(
+                full_html,
+                encoding="utf-8"
+            )
+
+            debug["html_length"] = len(full_html)
+
+            cards = collect_cards(page)
             debug["cards_found"] = len(cards)
 
-            log.info("Parsing cards...")
-
-            for index, card in enumerate(cards, 1):
-                check_timeout()
-
-                row = parse_card(card)
-
-                if row:
-                    rows.append(row)
-
-                if index % 10 == 0:
-                    log.info(
-                        "Processed %s/%s cards; qualifying: %s",
-                        index,
-                        len(cards),
-                        len(rows)
+            for index, item in enumerate(cards):
+                try:
+                    row, card_debug = parse_card(
+                        item,
+                        scraped_at
                     )
 
-            signals = group_signals(rows)
+                    # Save first 10 card HTML samples.
+                    if index < 10 and card_debug:
+                        debug["card_debug"].append(
+                            card_debug
+                        )
 
-            write_csv(LATEST, rows)
-            write_csv(SIGNALS, signals)
+                        html = card_debug.get(
+                            "selected_card_html",
+                            ""
+                        )
 
-            inserted = save_db(rows)
+                        if html:
+                            filename = (
+                                f"card_{index + 1}_"
+                                f"{safe_filename(str(index))}.html"
+                            )
 
-            debug["qualifying_rows"] = len(rows)
-            debug["signals"] = len(signals)
-            debug["new_database_records"] = inserted
-            debug["finished_at"] = now()
-            debug["duration_seconds"] = round(
-                time.monotonic() - started,
-                2
+                            (
+                                DEBUG_DIR / filename
+                            ).write_text(
+                                html,
+                                encoding="utf-8"
+                            )
+
+                    if row:
+                        rows.append(row)
+
+                except Exception as exc:
+                    debug["errors"].append(
+                        f"Card {index}: {type(exc).__name__}: {exc}"
+                    )
+
+        except Exception as exc:
+            debug["errors"].append(
+                f"Page error: {type(exc).__name__}: {exc}"
             )
-            debug["result"] = "completed"
-
-            with open(DEBUG, "w", encoding="utf-8") as f:
-                json.dump(debug, f, ensure_ascii=False, indent=2)
-
-            log.info("==============================")
-            log.info("Cards found: %s", len(cards))
-            log.info("Qualifying rows: %s", len(rows))
-            log.info("Signals: %s", len(signals))
-            log.info("New DB records: %s", inserted)
-            log.info("Duration: %s sec", debug["duration_seconds"])
-            log.info("==============================")
 
         finally:
             browser.close()
 
+    # Save latest complete snapshot.
+    write_csv(
+        LATEST_CSV,
+        rows,
+        CSV_FIELDS,
+        append=False
+    )
+
+    # Save only qualifying rows to the signals file.
+    qualifying_rows = [
+        row for row in rows
+        if row.get("qualifies")
+    ]
+
+    conn = init_database()
+
+    try:
+        new_history_rows = save_history(
+            conn,
+            rows
+        )
+    finally:
+        conn.close()
+
+    # Append only genuinely new database records.
+    write_csv(
+        HISTORY_CSV,
+        new_history_rows,
+        CSV_FIELDS,
+        append=True
+    )
+
+    signals = build_signals(rows)
+
+    write_csv(
+        SIGNALS_CSV,
+        signals,
+        SIGNAL_FIELDS,
+        append=False
+    )
+
+    finished = time.time()
+
+    debug.update({
+        "parsed_rows": len(rows),
+        "qualifying_rows": len(qualifying_rows),
+        "signals": len(signals),
+        "new_database_records": len(new_history_rows),
+        "finished_at": now_utc(),
+        "duration_seconds": round(finished - started, 2),
+        "result": "completed",
+        "files": {
+            "latest": str(LATEST_CSV),
+            "history": str(HISTORY_CSV),
+            "signals": str(SIGNALS_CSV),
+            "database": str(DATABASE),
+            "page_html": str(DEBUG_DIR / "oddsportal_page.html"),
+        },
+    })
+
+    DEBUG_JSON.write_text(
+        json.dumps(
+            debug,
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+    print(json.dumps(
+        {
+            "result": debug["result"],
+            "cards_found": debug["cards_found"],
+            "parsed_rows": debug["parsed_rows"],
+            "qualifying_rows": debug["qualifying_rows"],
+            "signals": debug["signals"],
+            "new_database_records": debug["new_database_records"],
+            "errors": debug["errors"],
+        },
+        ensure_ascii=False,
+        indent=2
+    ))
+
 
 if __name__ == "__main__":
-    try:
-        main()
-
-    except TimeoutError as exc:
-        log.error("TIMEOUT: %s", exc)
-
-        with open(DEBUG, "w", encoding="utf-8") as f:
-            json.dump({
-                "result": "timeout",
-                "error": str(exc),
-                "finished_at": now(),
-            }, f, ensure_ascii=False, indent=2)
-
-        raise SystemExit(0)
-
-    except Exception as exc:
-        log.exception("FATAL ERROR")
-
-        with open(DEBUG, "w", encoding="utf-8") as f:
-            json.dump({
-                "result": "error",
-                "error": str(exc),
-                "finished_at": now(),
-            }, f, ensure_ascii=False, indent=2)
-
-        raise
+    main()
