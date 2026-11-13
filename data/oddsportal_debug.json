@@ -1,20 +1,19 @@
 {
-  "scraped_at_utc": "2026-11-13T07:02:20+00:00",
-  "scraped_at_kyiv": "2026-11-13T09:02:28.622927+02:00",
+  "scraped_at_utc": "2026-11-13T15:23:03+00:00",
+  "scraped_at_kyiv": "2026-11-13T17:23:14.039195+02:00",
   "source": "https://www.oddsportal.com/dropping-odds/2/2/0/overall/",
   "http_status": 200,
   "page_title": "Dropping Odds – Live Updates & Betting Tips | Odds Portal",
-  "links_found": 36,
-  "unique_links": 18,
-  "parsed_rows": 10,
+  "links_found": 38,
+  "unique_links": 17,
+  "parsed_rows": 4,
   "qualifying_rows": 0,
   "signal_events": 0,
-  "new_history_records": 10,
-  "history_records_v2": 80,
+  "new_history_records": 4,
+  "history_records_v2": 84,
   "snapshot_records_v2": 0,
   "market_counts": {
-    "1X2": 5,
-    "total": 5
+    "1X2": 4
   },
   "t30_processed": 0,
   "telegram": {
@@ -41,5 +40,5 @@
   "old_database_tables_preserved": true,
   "timezone_assumption": "OddsPortal displayed kickoff time is treated as UTC; this assumption requires verification.",
   "t30_limitation": "T-30 uses nearest stored snapshot within +/-15 minutes; it does not independently refresh match odds.",
-  "elapsed_seconds": 8.04
+  "elapsed_seconds": 10.07
 }
